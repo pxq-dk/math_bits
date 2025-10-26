@@ -32,9 +32,15 @@ private:
 						std::is_same<long double,float_type>()),	 \
 						"multvalue datatype must be either float or double!");
 
+		static_assert(	(std::is_same<uint8_t,io_type>() || \
+						std::is_same<uint16_t,io_type>() || \
+						std::is_same<uint32_t,io_type>() || \
+						std::is_same<uint64_t,io_type>()),	 \
+						"io_type must be either uint8_t, uint16_t, uint32_t or uint64_t!");
+
 		calc_type maxVal = std::numeric_limits<calc_type>::max();
-		float_type tmp_res = (float_type)maxVal/(multFact*(float_type)max_input_value_);
-		return (calc_type)tmp_res;
+		float_type tmp_res = static_cast<float_type>(maxVal/(multFact*static_cast<float_type>(max_input_value_)));
+		return static_cast<calc_type>(tmp_res);
 	}
 
 	static constexpr uint8_t calc_bitshifts(calc_type value)
@@ -52,7 +58,7 @@ private:
 	{
 		calc_type maxVal = std::numeric_limits<calc_type>::max();
 		maxVal = maxVal >> ( std::numeric_limits<calc_type>::digits-bitshifts);
-		calc_type mult_val = (calc_type)round((multFact*(float_type)maxVal));
+		calc_type mult_val = static_cast<calc_type>(std::round((multFact*(static_cast<float_type>(maxVal)))));
 		return mult_val;
 	}
 
@@ -66,9 +72,9 @@ public:
 
 	OPT_MATH_SHIFT static constexpr io_type mult(io_type input_val)
 	{
-		calc_type output_val = ((calc_type)input_val)*mult_factor_int;
+		calc_type output_val = static_cast<calc_type>(input_val)*mult_factor_int;
 		output_val = output_val>>bitShifts;
-		return (io_type)output_val;
+		return static_cast<io_type>(output_val);
 	}
 
 	OPT_MATH_SHIFT constexpr io_type operator*(io_type val) const
