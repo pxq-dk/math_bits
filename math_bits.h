@@ -34,7 +34,7 @@ private:
 
 	static constexpr uint8_t calc_bitshifts(calc_type value)
 	{
-		return (uint8_t)floor(log2(value));
+		return static_cast<uint8_t>(std::floor(log2(value)));
 	}
 
 	static constexpr calc_type calc_mult_fact_int(auto multFact, uint8_t bitshifts)
@@ -60,7 +60,7 @@ public:
 		return (io_type)output_val;
 	}
 
-	OPT_MATH_SHIFT constexpr io_type operator*(io_type val)
+	OPT_MATH_SHIFT constexpr io_type operator*(io_type val) const
 	{
 		return mult(val);
 	}
