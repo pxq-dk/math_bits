@@ -4,14 +4,11 @@
  *  Created on: Oct 23, 2025
  *      Author: pxq-dk ( PxQ Technologies, https://pxq.dk )
  */
-
-#ifndef MATH_BITS_H_
-#define MATH_BITS_H_
-
 #include <limits>
 #include <cmath>
 #include <type_traits>
 
+#pragma once
 
 #ifdef __cplusplus
 
@@ -82,6 +79,3 @@ public:
 
 
 #endif //__cplusplus
-
-
-#endif /* MATH_BITS_H_ */
