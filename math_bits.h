@@ -21,7 +21,7 @@ class mult_bitshift
 private:
 	static constexpr calc_type calc_max_mult(float multFact, io_type max_input_value_)
 	{
-		calc_type maxVal = numeric_limits<calc_type>::max();
+		calc_type maxVal = std::numeric_limits<calc_type>::max();
 		float tmp_res = (float)maxVal/(multFact*(float)max_input_value_);
 		return (calc_type)tmp_res;
 	}
@@ -33,7 +33,7 @@ private:
 
 	static constexpr calc_type calc_mult_fact_int(float multFact, uint8_t bitshifts)
 	{
-		calc_type maxVal = numeric_limits<calc_type>::max();
+		calc_type maxVal = std::numeric_limits<calc_type>::max();
 		maxVal = maxVal >> ( std::numeric_limits<calc_type>::digits-bitshifts);
 		calc_type mult_val = (calc_type)round((multFact*(float)maxVal));
 		return mult_val;
