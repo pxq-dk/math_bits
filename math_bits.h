@@ -10,6 +10,7 @@
 
 #include <limits>
 #include <cmath>
+#include <type_traits>
 
 #define OPT_MATH_SHIFT __attribute__ ((optimize("-Os")))
 
@@ -21,7 +22,7 @@ class mult_bitshift
 
 private:
 	typedef decltype(multvalue)	float_type;
-	static constexpr calc_type calc_max_mult(auto multFact, io_type max_input_value_)
+	static constexpr calc_type calc_max_mult(float_type multFact, io_type max_input_value_)
 	{
 		// Check whether the datatype of multvalue is allowed.
 		static_assert(	(std::is_same<float,float_type>() || \
