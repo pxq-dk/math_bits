@@ -28,7 +28,7 @@ private:
 						"multvalue datatype must be either float or double!");
 
 		calc_type maxVal = std::numeric_limits<calc_type>::max();
-		float tmp_res = (decltype(multvalue))maxVal/(multFact*(decltype(multvalue))max_input_value_);
+		decltype(multvalue) tmp_res = (decltype(multvalue))maxVal/(multFact*(decltype(multvalue))max_input_value_);
 		return (calc_type)tmp_res;
 	}
 
