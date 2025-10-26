@@ -41,8 +41,14 @@ private:
 	}
 
 	static constexpr uint8_t calc_bitshifts(calc_type value)
-	{
-		return static_cast<uint8_t>(std::floor(log2(value)));
+	{	// Instead of using log2(c++23 and forwards), we also want to support C++20.
+		// Therefore integer constexpr function has been implemented without log2().
+		uint8_t shifts = 0;
+		while (value > 1) {
+			value >>= 1;
+			++shifts;
+		}
+		return shifts;
 	}
 
 	static constexpr calc_type calc_mult_fact_int(float_type multFact, uint8_t bitshifts)
