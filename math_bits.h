@@ -27,16 +27,14 @@ private:
 	static constexpr calc_type calc_max_mult(float_type multFact, io_type max_input_value_)
 	{
 		// Check whether the datatype of multvalue is allowed.
-		static_assert(	(std::is_same<float,float_type>() || \
-						std::is_same<double,float_type>() || \
-						std::is_same<long double,float_type>()),	 \
-						"multvalue datatype must be either float or double!");
 
-		static_assert(	(std::is_same<uint8_t,io_type>() || \
-						std::is_same<uint16_t,io_type>() || \
-						std::is_same<uint32_t,io_type>() || \
-						std::is_same<uint64_t,io_type>()),	 \
-						"io_type must be either uint8_t, uint16_t, uint32_t or uint64_t!");
+		static_assert(std::is_floating_point_v<float_type>, "multvalue must be float, double, or long double");
+		static_assert(std::is_unsigned_v<io_type>, "io_type must be an unsigned integer type");
+		static_assert(std::is_unsigned_v<calc_type>, "calc_type must be an unsigned integer type");
+
+		static_assert(std::numeric_limits<calc_type>::max()>=max_input_value, "max_input_value must be smaller than calc_type datasize can store!");
+
+		static_assert(std::numeric_limits<io_type>::max()>=max_input_value, "max_input_value must be smaller than io_type datasize can store!");
 
 		calc_type maxVal = std::numeric_limits<calc_type>::max();
 		float_type tmp_res = static_cast<float_type>(maxVal/(multFact*static_cast<float_type>(max_input_value_)));
