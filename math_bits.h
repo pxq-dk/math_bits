@@ -13,15 +13,13 @@
 #include <type_traits>
 
 
+#ifdef __cplusplus
+
 #if defined(__GNUC__) || defined(__clang__)
 	#define OPT_MATH_SHIFT [[gnu::optimize("Os")]]
 #else
 	#define OPT_MATH_SHIFT
 #endif
-
-
-
-#ifdef __cplusplus
 
 template<auto multvalue, uint32_t max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t>
 class mult_bitshift
