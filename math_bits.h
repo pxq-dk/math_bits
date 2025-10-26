@@ -15,14 +15,20 @@
 
 #ifdef __cplusplus
 
-template<float multvalue, uint32_t max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t>
+template<auto multvalue, uint32_t max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t>
 class mult_bitshift
 {
 private:
-	static constexpr calc_type calc_max_mult(float multFact, io_type max_input_value_)
+	static constexpr calc_type calc_max_mult(auto multFact, io_type max_input_value_)
 	{
+		// Check whether the datatype of multvalue is allowed.
+		static_assert(	(std::is_same<float,decltype(multFact)>() || \
+						std::is_same<double,decltype(multFact)>() || \
+						std::is_same<long double,decltype(multFact)>()),	 \
+						"multvalue datatype must be either float or double!");
+
 		calc_type maxVal = std::numeric_limits<calc_type>::max();
-		float tmp_res = (float)maxVal/(multFact*(float)max_input_value_);
+		float tmp_res = (decltype(multvalue))maxVal/(multFact*(decltype(multvalue))max_input_value_);
 		return (calc_type)tmp_res;
 	}
 
@@ -31,15 +37,15 @@ private:
 		return (uint8_t)floor(log2(value));
 	}
 
-	static constexpr calc_type calc_mult_fact_int(float multFact, uint8_t bitshifts)
+	static constexpr calc_type calc_mult_fact_int(auto multFact, uint8_t bitshifts)
 	{
 		calc_type maxVal = std::numeric_limits<calc_type>::max();
 		maxVal = maxVal >> ( std::numeric_limits<calc_type>::digits-bitshifts);
-		calc_type mult_val = (calc_type)round((multFact*(float)maxVal));
+		calc_type mult_val = (calc_type)round((multFact*(decltype(multvalue))maxVal));
 		return mult_val;
 	}
 
-	static constexpr float mult_factor{multvalue};
+	static constexpr auto mult_factor{multvalue};
 	static constexpr io_type max_input_int{max_input_value};
 	static constexpr calc_type max_mult_fact{calc_max_mult(mult_factor, max_input_int)};
 	static constexpr uint8_t bitShifts{calc_bitshifts(max_mult_fact)};
@@ -59,6 +65,7 @@ public:
 		return mult(val);
 	}
 };
+
 
 #endif //__cplusplus
 
