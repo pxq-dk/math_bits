@@ -12,7 +12,14 @@
 #include <cmath>
 #include <type_traits>
 
-#define OPT_MATH_SHIFT __attribute__ ((optimize("-Os")))
+
+#if defined(__GNUC__) || defined(__clang__)
+	#define OPT_MATH_SHIFT [[gnu::optimize("Os")]]
+#else
+	#define OPT_MATH_SHIFT
+#endif
+
+
 
 #ifdef __cplusplus
 
