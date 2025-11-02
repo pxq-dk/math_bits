@@ -31,7 +31,7 @@ class mult_bitshift
 {
 private:
     // Define the type of the multiplier (float, double, or long double)
-    typedef decltype(multvalue) float_type;
+    using float_type = decltype(multvalue);
 
     // Calculate the maximum multiplication factor that fits into calc_type
     static constexpr calc_type calc_max_mult()
