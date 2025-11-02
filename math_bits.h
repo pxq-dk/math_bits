@@ -26,7 +26,7 @@
 
 // Template class for performing multiplication by a floating-point value
 // using integer bit-shifting to approximate the result efficiently.
-template<auto multvalue, auto max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t>
+template<auto multvalue, auto max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t, bool force_inlining=false>
 class mult_bitshift
 {
 private:
@@ -83,7 +83,8 @@ private:
     }
 
 public:
-    using mult_bitshift_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type>;
+    static constexpr bool inlined = force_inlining;
+    using mult_bitshift_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, inlined>;
     // Template constants for internal calculations
     static constexpr float_type mult_factor{multvalue};        // Floating-point multiplier
     static constexpr io_type max_input_int{max_input_value};   // Maximum allowed input
@@ -92,7 +93,7 @@ public:
     static constexpr calc_type mult_factor_int{calc_mult_fact_int()}; // Integer multiplier
 
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
-    OPT_MATH_SHIFT static constexpr inline io_type mult(io_type input_val)
+    OPT_MATH_SHIFT_INLINE static constexpr inline io_type mult_inlined(io_type input_val)
     {
         // Scale the input using integer multiplier
         calc_type output_val = static_cast<calc_type>(input_val) * mult_factor_int;
@@ -100,7 +101,30 @@ public:
         return static_cast<io_type>(output_val); // Cast back to original type
     }
 
-//     Overload the * operator to use the optimized multiplication
+    // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
+    OPT_MATH_SHIFT static constexpr inline io_type mult_noninlined(io_type input_val)
+    {
+        // Scale the input using integer multiplier
+        calc_type output_val = static_cast<calc_type>(input_val) * mult_factor_int;
+        output_val = output_val >> bitShifts; // Divide by 2^bitShifts
+        return static_cast<io_type>(output_val); // Cast back to original type
+    }
+
+    // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
+    OPT_MATH_SHIFT_INLINE static constexpr inline io_type mult(io_type input_val)
+    {
+    	// Selection between inline/non inline version
+    	if constexpr(inlined)
+		{
+    		return mult_inlined(input_val);
+		}
+    	else
+    	{
+    		return mult_noninlined(input_val);
+    	}
+    }
+
+    // Overload the * operator to use the optimized multiplication
     OPT_MATH_SHIFT_INLINE constexpr inline io_type operator*(io_type val) const
     {
         return mult(val);
