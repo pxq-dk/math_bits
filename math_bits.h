@@ -18,8 +18,10 @@
 // Only applies for GCC or Clang. Other compilers ignore it.
 #if defined(__GNUC__) || defined(__clang__)
     #define OPT_MATH_SHIFT [[gnu::optimize("Os")]] // Optimize for size
+    #define OPT_MATH_SHIFT_INLINE [[gnu::always_inline, gnu::optimize("Os")]] // Optimize for size
 #else
     #define OPT_MATH_SHIFT
+	#define OPT_MATH_SHIFT_INLINE
 #endif
 
 // Template class for performing multiplication by a floating-point value
@@ -80,14 +82,14 @@ private:
         return mult_val;
     }
 
+public:
+    using mult_bitshift_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type>;
     // Template constants for internal calculations
     static constexpr float_type mult_factor{multvalue};        // Floating-point multiplier
     static constexpr io_type max_input_int{max_input_value};   // Maximum allowed input
     static constexpr calc_type max_mult_fact{calc_max_mult()}; // Maximum multiplication factor
     static constexpr uint8_t bitShifts{calc_bitshifts()};     // Number of bits to shift
     static constexpr calc_type mult_factor_int{calc_mult_fact_int()}; // Integer multiplier
-
-public:
 
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
     OPT_MATH_SHIFT static constexpr inline io_type mult(io_type input_val)
@@ -98,10 +100,16 @@ public:
         return static_cast<io_type>(output_val); // Cast back to original type
     }
 
-    // Overload the * operator to use the optimized multiplication
-    OPT_MATH_SHIFT constexpr inline io_type operator*(io_type val) const
+//     Overload the * operator to use the optimized multiplication
+    OPT_MATH_SHIFT_INLINE constexpr inline io_type operator*(io_type val) const
     {
         return mult(val);
+    }
+
+    // Overload the * operator to use the optimized multiplication
+    OPT_MATH_SHIFT_INLINE friend constexpr inline io_type operator*(io_type val, mult_bitshift_type& rhs)
+    {
+    	return rhs.mult(val);
     }
 };
 
