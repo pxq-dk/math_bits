@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <cstdint>
 #include <bit>
+#include <array>
 
 #pragma once
 
@@ -24,14 +25,125 @@
 	#define OPT_MATH_SHIFT_INLINE
 #endif
 
+// Template class with unit testing for mult_bitshift class.
+template<typename multType>
+class unit_test_mult_bitshift
+{
+
+public:
+	using mult_type = multType::mult_type;
+    using float_type = multType::float_type;
+    using io_type = multType::io_type_t;
+    using calc_type = multType::calc_type_t;
+
+    static constexpr bool test_in_depth{true};
+
+    static constexpr io_type max_deviation = multType::max_deviation;
+    static constexpr uint64_t min_loop_iterations = 100;
+    static constexpr uint64_t max_loop_iterations = std::numeric_limits<uint16_t>::max();
+    static constexpr uint64_t calc_loop_iterations()
+    {
+    	constexpr uint64_t io_type_count = static_cast<uint64_t>(std::numeric_limits<io_type>::max()) + 1;
+
+    	uint64_t iterations = 0;
+    	if constexpr (io_type_count>max_loop_iterations)
+    	{	iterations = max_loop_iterations;    	}
+    	else
+    	{	iterations = io_type_count;	}
+
+        if constexpr(!test_in_depth)
+    	{
+        	iterations = min_loop_iterations;
+    	}
+
+        return iterations;
+    }
+
+    static constexpr uint64_t loop_iterations = calc_loop_iterations();
+
+    static constexpr float_type mult_factor = multType::mult_factor;        // Floating-point multiplier
+
+    template <calc_type N, double start, double end>
+    static constexpr std::array<double, N> linspace() {
+
+        std::array<double, N> arr{};
+
+        const double step = (end - start) / (N - 1);
+
+        for (calc_type i = 0; i < N; ++i)
+            arr[i] = start + i * step;
+
+        return arr;
+    }
+
+    static constexpr bool number_ok(io_type test_value)
+    {
+    	bool succes = false;
+    	io_type input =static_cast<io_type>(test_value);
+
+    	io_type res_expected = static_cast<io_type>((float_type)input*mult_factor);
+    	io_type res_actual = multType::mult(input);
+
+    	io_type res_min,res_max;
+
+    	if(res_expected>max_deviation)
+    	{	res_min = res_expected-max_deviation;	}
+    	else
+    	{	res_min = 0;	}
+
+    	if(res_expected< (std::numeric_limits<io_type>::max() -max_deviation))
+    	{	res_max = res_expected+max_deviation;	}
+    	else
+    	{	res_max = std::numeric_limits<io_type>::max();		}
+
+    	if(res_min>res_actual)
+    	{	succes = false;	}
+    	else if(res_max<res_actual)
+    	{	succes = false;	}
+    	else
+    	{	succes = true;	}
+
+    	return succes;
+    }
+
+    static constexpr bool run_test()
+    {
+    	constexpr double start = 0;
+    	constexpr double stop = multType::max_input_int;
+    	constexpr calc_type elementTestCount = loop_iterations;
+
+    	constexpr std::array<double, elementTestCount> values = linspace<elementTestCount, start, stop>();
+
+    	bool succes = true;
+
+    	for(auto value : values)
+    	{
+    		if(value<0)	value = 0;
+    		io_type input =static_cast<io_type>(value);
+    		bool res = number_ok(input);
+    		if(!res)
+    		{	succes = false;	}
+    	}
+
+    	return succes;
+    }
+};
+
+
+
 // Template class for performing multiplication by a floating-point value
 // using integer bit-shifting to approximate the result efficiently.
-template<auto multvalue, auto max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t, bool force_inlining=false>
+template<auto multvalue, auto max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t, io_type max_error=1, bool force_inlining=false>
 class mult_bitshift
 {
-private:
+public:
+	using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, max_error, force_inlining>;
     // Define the type of the multiplier (float, double, or long double)
     using float_type = decltype(multvalue);
+    using io_type_t = io_type;
+    using calc_type_t = calc_type;
+
+    static constexpr bool inlined = force_inlining;
 
     // Calculate the maximum multiplication factor that fits into calc_type
     static constexpr calc_type calc_max_mult()
@@ -82,10 +194,8 @@ private:
         return mult_val;
     }
 
-public:
-    static constexpr bool inlined = force_inlining;
-    using mult_bitshift_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, inlined>;
     // Template constants for internal calculations
+    static constexpr io_type max_deviation{max_error};
     static constexpr float_type mult_factor{multvalue};        // Floating-point multiplier
     static constexpr io_type max_input_int{max_input_value};   // Maximum allowed input
     static constexpr calc_type max_mult_fact{calc_max_mult()}; // Maximum multiplication factor
@@ -131,10 +241,11 @@ public:
     }
 
     // Overload the * operator to use the optimized multiplication
-    OPT_MATH_SHIFT_INLINE friend constexpr inline io_type operator*(io_type val, mult_bitshift_type& rhs)
+    OPT_MATH_SHIFT_INLINE friend constexpr inline io_type operator*(io_type val, mult_type& rhs)
     {
     	return rhs.mult(val);
     }
-};
 
+    static_assert(unit_test_mult_bitshift<mult_type>::run_test(), "Static unit-testing failed! Consider increasing max_error!");
+};
 #endif // __cplusplus
