@@ -1,5 +1,5 @@
 /*
- * math_bitshifting.h
+ * math_bits.h
  *
  *  Created on: Oct 23, 2025
  *      Author: pxq-dk ( PxQ Technologies, https://pxq.dk )
