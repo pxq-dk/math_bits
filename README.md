@@ -1,0 +1,2 @@
+math_bits provides high-performance, FPU-free multiplication of integer values by constant floating-point factors.
+Designed for microcontrollers without hardware floating-point support, it replaces slow runtime float operations with optimized integer arithmetic, delivering faster execution, deterministic timing, and reduced overhead — ideal for real-time and resource-constrained embedded systems.
