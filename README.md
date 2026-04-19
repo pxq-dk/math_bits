@@ -1,77 +1,120 @@
-# math_bits — Fast, FPU‑free constant‑factor multiplication
-math_bits provides high‑performance multiplication of integer values by constant floating‑point factors, without using hardware floating‑point instructions.
-The library replaces slow runtime float operations with optimized integer arithmetic generated at compile time.
+# math_bits
 
-Ideal for microcontrollers and embedded systems without FPU support.
+Header-only C++20 library for multiplying integers by a constant floating-point factor using integer bit-shifting — no FPU, no runtime division, compile-time unit tests.
 
-# Features
-- Header‑only C++20 library
-- Compile‑time generation of integer multiplier and bit‑shift parameters
-- No floating‑point operations at runtime
-- Deterministic execution time (ISR‑safe)
-- Static unit‑testing at compile time
-- Supports 8‑bit, 16‑bit, and 32‑bit integer types
-- Configurable maximum input range and allowed error
+---
 
-# Example
+## Features
+
+- **No floating-point at runtime** — all FPU operations happen at compile time. The generated code is pure integer arithmetic.
+- **Compile-time parameter generation** — multiplier, bit-shift count, and integer scale factor are all derived at compile time from the floating-point input.
+- **Overflow safe** — the maximum multiplication factor is computed at compile time to guarantee no overflow for the given input range.
+- **Configurable accuracy** — `max_error` template parameter sets the allowed deviation from the true floating-point result. Defaults to ±1 LSB.
+- **Compile-time unit tests** — a `static_assert` runs a full test suite at compile time. A broken instantiation will not compile.
+- **Header-only** — single `.h` file, no dependencies beyond the C++ standard library.
+- **Inlining control** — optional `force_inlining` template parameter forces `[[gnu::always_inline]]` on the hot path.
+
+---
+
+## Requirements
+
+- C++20 or later (`std::bit_width` is used for compile-time bit counting)
+- Any C++20 compiler (GCC, Clang, MSVC)
+- No hardware FPU required — designed for Cortex-M0/M0+ and other FPU-less targets
+
+---
+
+## Usage
+
+### Basic
+
 ```cpp
 #include "math_bits.h"
 
-// Multiply by 1.234 with max input 4095(f.ex 12bit adc), allow ±1 LSB error on result
-constexpr double factor_value = 1.234;
-constexpr max_input_value = 4095;
-using calc_variable_type = uint32_t;
-using result_variable_type = uint16_t;
-constexpr uint16_t allowed_error = 1;
-using factor_type = mult_bitshift<factor_value, max_input_value, result_variable_type, calc_variable_type, allowed_error>;
+// Multiply uint16_t values by 0.75, input range [0, 1000], max error ±1
+using scale75 = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t>;
 
-factor_type factor;
-uint16_t value = 1000;
-uint16_t result = factor * value;
+uint16_t result = scale75::mult(800);  // result ≈ 600
 ```
 
+### Operator overload
 
-# Template parameters
 ```cpp
-template<
-    auto multvalue,          // Floating-point multiplier (float/double/long double)
-    auto max_input_value,    // Maximum allowed input
-    typename io_type=uint32_t,
-    typename calc_type=uint32_t,
-    io_type max_error=1,     // Allowed deviation from true float result
-    bool force_inlining=false
->
-class mult_bitshift;
+scale75 scaler;
+uint16_t result = scaler * 800;  // same as scale75::mult(800)
 ```
 
-# Parameter meaning
-| Parameter | Description |
-|----------|-------------|
-| `multvalue` | The constant floating‑point factor (e.g., 1.234) |
-| `max_input_value` | Maximum integer input the multiplier must support |
-| `io_type` | Input/output integer type |
-| `calc_type` | Internal calculation type |
-| `max_error` | Allowed deviation from true float result |
-| `force_inlining` | Force inline version of multiplication |
+### With forced inlining
 
-# Compile‑time unit testing
-Each instantiation of mult_bitshift runs a constexpr unit test verifying:
-- error bounds
-- integer overflow safety
-- correct bit‑shift scaling
-If the test fails, compilation stops with a clear static assertion.
+```cpp
+using scale75_inline = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, 1, true>;
+uint16_t result = scale75_inline::mult(800);
+```
 
-# Performance
-- No floating‑point instructions
-- Only integer multiply + bit‑shift
-- Constant execution time
-- Suitable for real‑time control loops and ISR contexts
-- Low‑power MCUs
-- DSP‑like operations without an FPU
+---
 
-# Accuracy
-The result is guaranteed to be within:
-```± max_error``` of the true floating‑point multiplication.
+## Template Parameters
 
-# License
-MIT
+| Parameter | Default | Description |
+|---|---|---|
+| `multvalue` | — | Floating-point multiplier (`float`, `double`, or `long double`) |
+| `max_input_value` | — | Maximum input value the multiplier must handle without overflow |
+| `io_type` | `uint32_t` | Input and output integer type. Must be unsigned. |
+| `calc_type` | `uint32_t` | Internal calculation type. Must be unsigned and at least as wide as `io_type`. |
+| `max_error` | `1` | Maximum allowed deviation from the true floating-point result (in LSB) |
+| `force_inlining` | `false` | Force `[[gnu::always_inline]]` on the `mult()` function |
+
+---
+
+## API Reference
+
+| Function | Description |
+|---|---|
+| `mult(input)` | Multiply `input` by the configured factor. Static — no instance needed. |
+| `operator*(val)` | Instance operator overload — calls `mult(val)`. |
+| `operator*(val, rhs)` | Friend operator overload — `val * scaler`. |
+
+### Compile-time constants
+
+| Constant | Description |
+|---|---|
+| `mult_factor` | The original floating-point multiplier |
+| `max_input_int` | The configured maximum input value |
+| `bitShifts` | Number of bits shifted in the integer multiplication |
+| `mult_factor_int` | The integer scale factor derived from `mult_factor` |
+| `max_deviation` | The configured `max_error` |
+
+---
+
+## Design Notes
+
+**Why bit-shifting instead of floating-point?**
+On Cortex-M0/M0+ there is no FPU. A floating-point multiply compiles to a software library call — slow, non-deterministic, and unsuitable for ISRs. By computing the scale factor at compile time and using a single integer multiply + shift at runtime, the hot path becomes 2–3 instructions with deterministic latency.
+
+**Why compile-time unit tests?**
+The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required.
+
+**Why waste one extra type parameter for `calc_type`?**
+The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `io_type` at the end.
+
+---
+
+## Performance (STM32G051, Cortex-M0+, `-Os`)
+
+- **`mult()`**: 2–3 instructions — one multiply, one shift, one cast
+- **No FPU instructions** — zero soft-float library calls at runtime
+- **Compile-time overhead**: parameter generation and unit test run entirely at compile time — zero runtime cost
+
+---
+
+## License
+
+Copyright (c) 2026 PxQ Technologies — https://pxq.dk
+
+**Open Source / Non-Commercial Use:**
+Free to use, modify, and distribute under the MIT License, provided it is used solely in open source or non-commercial projects. The copyright notice must be retained.
+
+**Commercial Use:**
+Requires either a written commercial license agreement with PxQ Technologies, or direct delivery by Erik Nørskov (PxQ Technologies) as part of a paid engagement or employment, in which case a license is granted for use within that specific project scope only.
+
+Contact: https://pxq.dk
