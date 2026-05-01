@@ -3,6 +3,30 @@
  *
  *  Created on: Oct 23, 2025
  *      Author: pxq-dk ( PxQ Technologies, https://pxq.dk )
+ *
+ *  Copyright (c) 2026 PxQ Technologies
+ *  https://pxq.dk
+ *
+ *  Dual License:
+ *
+ *  1. GNU General Public License v3.0 (GPLv3)
+ *     This file is free software: you can redistribute it and/or modify
+ *     it under the terms of the GNU General Public License as published by
+ *     the Free Software Foundation, version 3 of the License.
+ *
+ *     This file is distributed in the hope that it will be useful,
+ *     but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ *     General Public License for more details: https://www.gnu.org/licenses/
+ *
+ *  2. Commercial License
+ *     For use in proprietary or closed-source products that cannot or
+ *     do not wish to comply with the GPLv3, a separate commercial license
+ *     is available from PxQ Technologies — either as a written agreement,
+ *     or via direct delivery by Erik Nørskov as part of a paid engagement
+ *     (in which case the license is granted for that specific project scope only).
+ *
+ *     Contact: https://pxq.dk
  */
 #include <limits>
 #include <cmath>

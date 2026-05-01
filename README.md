@@ -111,10 +111,12 @@ The intermediate product `input * mult_factor_int` can overflow `io_type`. Using
 
 Copyright (c) 2026 PxQ Technologies — https://pxq.dk
 
-**Open Source / Non-Commercial Use:**
-Free to use, modify, and distribute under the MIT License, provided it is used solely in open source or non-commercial projects. The copyright notice must be retained.
+This software is dual-licensed:
 
-**Commercial Use:**
-Requires either a written commercial license agreement with PxQ Technologies, or direct delivery by Erik Nørskov (PxQ Technologies) as part of a paid engagement or employment, in which case a license is granted for use within that specific project scope only.
+**1. Open Source — GNU General Public License v3.0 (GPLv3):**
+Free to use, modify, and distribute under the terms of the GNU General Public License version 3, as published by the Free Software Foundation. Note that GPLv3 is strong copyleft — derivative works and products that incorporate this software must also be released under GPLv3.
+
+**2. Commercial License:**
+For use in proprietary or closed-source products that cannot or do not wish to comply with the GPLv3, a commercial license is available from PxQ Technologies — either as a written agreement, or via direct delivery by Erik Nørskov as part of a paid engagement (in which case the license is granted for that specific project scope only).
 
 Contact: https://pxq.dk
