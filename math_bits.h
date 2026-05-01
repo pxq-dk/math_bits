@@ -67,13 +67,13 @@ public:
     static constexpr uint64_t max_loop_iterations = std::numeric_limits<uint16_t>::max();
     static constexpr uint64_t calc_loop_iterations()
     {
-    	constexpr uint64_t io_type_count = static_cast<uint64_t>(std::numeric_limits<io_type>::max()) + 1;
+    	constexpr uint64_t io_type_max = static_cast<uint64_t>(std::numeric_limits<io_type>::max());
 
     	uint64_t iterations = 0;
-    	if constexpr (io_type_count>max_loop_iterations)
+    	if constexpr (io_type_max >= max_loop_iterations)
     	{	iterations = max_loop_iterations;    	}
     	else
-    	{	iterations = io_type_count;	}
+    	{	iterations = io_type_max + 1;	}
 
         if constexpr(!test_in_depth)
     	{
