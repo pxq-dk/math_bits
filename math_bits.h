@@ -102,7 +102,7 @@ public:
 
     static constexpr bool number_ok(io_type test_value)
     {
-    	bool succes = false;
+    	bool success = false;
     	io_type input =static_cast<io_type>(test_value);
 
     	io_type res_expected = static_cast<io_type>(static_cast<long double>(input) * static_cast<long double>(mult_factor));
@@ -121,13 +121,13 @@ public:
     	{	res_max = std::numeric_limits<io_type>::max();		}
 
     	if(res_min>res_actual)
-    	{	succes = false;	}
+    	{	success = false;	}
     	else if(res_max<res_actual)
-    	{	succes = false;	}
+    	{	success = false;	}
     	else
-    	{	succes = true;	}
+    	{	success = true;	}
 
-    	return succes;
+    	return success;
     }
 
     static constexpr bool run_test()
@@ -138,7 +138,7 @@ public:
 
     	constexpr std::array<double, elementTestCount> values = linspace<elementTestCount, start, stop>();
 
-    	bool succes = true;
+    	bool success = true;
 
     	for(auto value : values)
     	{
@@ -146,10 +146,10 @@ public:
     		io_type input =static_cast<io_type>(value);
     		bool res = number_ok(input);
     		if(!res)
-    		{	succes = false;	}
+    		{	success = false;	}
     	}
 
-    	return succes;
+    	return success;
     }
 };
 
