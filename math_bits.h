@@ -187,6 +187,11 @@ public:
         static_assert(std::numeric_limits<io_type>::max() >= max_input_value,
                       "max_input_value must be smaller than io_type datasize can store!");
 
+        // Ensure the result of mult(max_input_value) fits in io_type
+        static_assert(static_cast<long double>(multvalue) * static_cast<long double>(max_input_value)
+                      <= static_cast<long double>(std::numeric_limits<io_type>::max()),
+                      "multvalue * max_input_value would overflow io_type!");
+
         // Calculate the maximum multiplication factor that won't overflow calc_type
         constexpr long double maxVal = static_cast<long double>(std::numeric_limits<calc_type>::max());
         constexpr long double res = maxVal / (static_cast<long double>(multvalue) * static_cast<long double>(max_input_value));
