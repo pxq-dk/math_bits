@@ -105,7 +105,7 @@ public:
     	bool succes = false;
     	io_type input =static_cast<io_type>(test_value);
 
-    	io_type res_expected = static_cast<io_type>((float_type)input*mult_factor);
+    	io_type res_expected = static_cast<io_type>(static_cast<long double>(input) * static_cast<long double>(mult_factor));
     	io_type res_actual = multType::mult(input);
 
     	io_type res_min,res_max;
