@@ -31,7 +31,6 @@
 
 #pragma once
 #include <limits>
-#include <cmath>
 #include <type_traits>
 #include <cstdint>
 #include <bit>
