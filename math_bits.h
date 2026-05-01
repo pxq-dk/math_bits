@@ -28,14 +28,14 @@
  *
  *     Contact: https://pxq.dk
  */
+
+#pragma once
 #include <limits>
 #include <cmath>
 #include <type_traits>
 #include <cstdint>
 #include <bit>
 #include <array>
-
-#pragma once
 
 #ifdef __cplusplus
 
