@@ -88,6 +88,7 @@ public:
 
     template <calc_type N, double start, double end>
     static constexpr std::array<double, N> linspace() {
+        static_assert(N >= 2, "linspace requires N >= 2 (need at least two points to define a spacing)");
 
         std::array<double, N> arr{};
 
