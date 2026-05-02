@@ -51,6 +51,13 @@ using scale75_inline = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, 1
 uint16_t result = scale75_inline::mult(800);
 ```
 
+### Faster compile (skip deep test sweep)
+
+```cpp
+// Same as scale75 but only smoke-tests 100 inputs at compile time instead of 65535
+using scale75_fast = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, 1, false, false>;
+```
+
 ---
 
 ## Template Parameters
@@ -63,6 +70,7 @@ uint16_t result = scale75_inline::mult(800);
 | `calc_type` | `uint32_t` | Internal calculation type. Must be unsigned and at least as wide as `io_type`. |
 | `max_error` | `1` | Maximum allowed deviation from the true floating-point result (in LSB) |
 | `force_inlining` | `false` | Force `[[gnu::always_inline]]` on the `mult()` function |
+| `deep_test` | `true` | Run the full compile-time test sweep (up to 65535 inputs). Set `false` for a quick smoke test (100 inputs) when compile time matters. |
 
 ---
 
@@ -92,7 +100,7 @@ uint16_t result = scale75_inline::mult(800);
 On Cortex-M0/M0+ there is no FPU. A floating-point multiply compiles to a software library call — slow, non-deterministic, and unsuitable for ISRs. By computing the scale factor at compile time and using a single integer multiply + shift at runtime, the hot path becomes 2–3 instructions with deterministic latency.
 
 **Why compile-time unit tests?**
-The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required.
+The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. The sweep is bounded at 65535 samples; if compile time becomes a concern, set `deep_test=false` to drop to a 100-sample smoke test.
 
 **Why waste one extra type parameter for `calc_type`?**
 The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `io_type` at the end.

@@ -49,7 +49,7 @@
 #endif
 
 // Template class with unit testing for mult_bitshift class.
-template<typename multType>
+template<typename multType, bool DeepTest = true>
 class unit_test_mult_bitshift
 {
 
@@ -59,7 +59,7 @@ public:
     using io_type = multType::io_type_t;
     using calc_type = multType::calc_type_t;
 
-    static constexpr bool test_in_depth{true};
+    static constexpr bool test_in_depth{DeepTest};
 
     static constexpr io_type max_deviation = multType::max_deviation;
     static constexpr uint64_t min_loop_iterations = 100;
@@ -156,11 +156,11 @@ public:
 
 // Template class for performing multiplication by a floating-point value
 // using integer bit-shifting to approximate the result efficiently.
-template<auto multvalue, auto max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t, io_type max_error=1, bool force_inlining=false>
+template<auto multvalue, auto max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t, io_type max_error=1, bool force_inlining=false, bool deep_test=true>
 class mult_bitshift
 {
 public:
-	using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, max_error, force_inlining>;
+	using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, max_error, force_inlining, deep_test>;
     // Define the type of the multiplier (float, double, or long double)
     using float_type = decltype(multvalue);
     using io_type_t = io_type;
@@ -274,6 +274,6 @@ public:
     	return rhs.mult(val);
     }
 
-    static_assert(unit_test_mult_bitshift<mult_type>::run_test(), "Static unit-testing failed! Consider increasing max_error!");
+    static_assert(unit_test_mult_bitshift<mult_type, deep_test>::run_test(), "Static unit-testing failed! Consider increasing max_error!");
 };
 #endif // __cplusplus
