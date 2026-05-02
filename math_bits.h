@@ -238,6 +238,11 @@ public:
     static constexpr uint8_t bitShifts{calc_bitshifts()};     // Number of bits to shift
     static constexpr calc_type mult_factor_int{calc_mult_fact_int()}; // Integer multiplier
 
+    // Defense-in-depth: max_input_value * mult_factor_int must not overflow calc_type at runtime
+    static_assert(static_cast<long double>(max_input_int) * static_cast<long double>(mult_factor_int)
+                  <= static_cast<long double>(std::numeric_limits<calc_type>::max()),
+                  "max_input_value * mult_factor_int would overflow calc_type — choose a wider calc_type or smaller max_input_value!");
+
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
     OPT_MATH_SHIFT_INLINE static constexpr inline io_type mult_inlined(io_type input_val)
     {
