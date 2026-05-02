@@ -109,9 +109,12 @@ The intermediate product `input * mult_factor_int` can overflow `io_type`. Using
 
 ## Performance (STM32G051, Cortex-M0+, `-Os`)
 
-- **`mult()`**: 2–3 instructions — one multiply, one shift, one cast
-- **No FPU instructions** — zero soft-float library calls at runtime
-- **Compile-time overhead**: parameter generation and unit test run entirely at compile time — zero runtime cost
+Verified by inspecting `arm-none-eabi-g++` output for representative configurations:
+
+- **`mult()` with `calc_type ≤ uint32_t`**: hot path is `muls + lsrs` — one integer multiply, one bit-shift. A 1–2 instruction `movs/lsls` constant-load preamble brings the total to ~4 instructions on Cortex-M0+ (the constant load is an M0+ immediate-encoding limitation, not a library limitation).
+- **`mult()` with `calc_type = uint64_t`**: the multiply is widened, so the compiler emits a call to the integer runtime helper `__aeabi_lmul` — still no FPU, still deterministic, but no longer a single instruction. **Prefer `calc_type=uint32_t` on Cortex-M0+ when your inputs and multiplier allow it.**
+- **No FPU instructions** in either case — zero soft-float library calls at runtime.
+- **Compile-time overhead**: parameter generation and unit test run entirely at compile time — zero runtime cost.
 
 ---
 
