@@ -269,7 +269,7 @@ public:
     }
 
     // Overload the * operator to use the optimized multiplication
-    OPT_MATH_SHIFT_INLINE friend constexpr inline io_type operator*(io_type val, mult_type& rhs)
+    OPT_MATH_SHIFT_INLINE friend constexpr inline io_type operator*(io_type val, const mult_type& rhs)
     {
     	return rhs.mult(val);
     }
