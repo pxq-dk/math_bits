@@ -58,6 +58,14 @@ uint16_t result = scale75_inline::mult(800);
 using scale75_fast = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, 1, false, false>;
 ```
 
+### Clamp inputs to the configured maximum
+
+```cpp
+// Inputs above 1000 are silently clamped to 1000 before multiplying.
+using scale75_safe = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, 1, false, true, true>;
+uint16_t result = scale75_safe::mult(2000); // returns mult(1000), not garbage
+```
+
 ---
 
 ## Template Parameters
@@ -71,6 +79,7 @@ using scale75_fast = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, 1, 
 | `max_error` | `1` | Maximum allowed deviation from the true floating-point result (in LSB) |
 | `force_inlining` | `false` | Force `[[gnu::always_inline]]` on the `mult()` function |
 | `deep_test` | `true` | Run the full compile-time test sweep (up to 65535 inputs). Set `false` for a quick smoke test (100 inputs) when compile time matters. |
+| `clamp_input` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
 
 ---
 
@@ -90,6 +99,7 @@ using scale75_fast = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, 1, 
 | `max_input_int` | The configured maximum input value |
 | `bitShifts` | Number of bits shifted in the integer multiplication |
 | `mult_factor_int` | The integer scale factor derived from `mult_factor` |
+| `max_output_int` | Precomputed `mult(max_input_int)` — the largest value `mult()` will ever return |
 | `max_deviation` | The configured `max_error` |
 
 ---
@@ -115,6 +125,8 @@ Verified by inspecting `arm-none-eabi-g++` output for representative configurati
 - **`mult()` with `calc_type = uint64_t`**: the multiply is widened, so the compiler emits a call to the integer runtime helper `__aeabi_lmul` — still no FPU, still deterministic, but no longer a single instruction. **Prefer `calc_type=uint32_t` on Cortex-M0+ when your inputs and multiplier allow it.**
 - **No FPU instructions** in either case — zero soft-float library calls at runtime.
 - **Compile-time overhead**: parameter generation and unit test run entirely at compile time — zero runtime cost.
+- **`clamp_input=true` + `force_inlining=true`** is the recommended combination when the clamp is needed. The clamp uses an early-return path with a precomputed `max_output_int`, which is slightly larger than the no-clamp body and may exceed GCC's `-Os` auto-inline threshold without `force_inlining=true`. With `force_inlining=true`, the clamp path is fully inlined into the caller (~9 instructions on the common path).
+- **`[[gnu::flatten]]` on user code** is the strongest way to force inlining at a specific call site without touching the library — useful when calling `mult()` from a hot loop where you want every call inlined regardless of the library's `force_inlining` setting.
 
 ---
 
