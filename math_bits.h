@@ -236,6 +236,11 @@ public:
     static constexpr io_type max_input_int{max_input_value};   // Maximum allowed input
     static constexpr calc_type max_mult_fact{calc_max_mult()}; // Maximum multiplication factor
     static constexpr uint8_t bitShifts{calc_bitshifts()};     // Number of bits to shift
+
+    // Defense-in-depth: shift count must be < calc_type width for well-defined shift behavior
+    static_assert(bitShifts < std::numeric_limits<calc_type>::digits,
+                  "bitShifts must be < digits(calc_type) — required for well-defined shift behavior!");
+
     static constexpr calc_type mult_factor_int{calc_mult_fact_int()}; // Integer multiplier
 
     // Defense-in-depth: max_input_value * mult_factor_int must not overflow calc_type at runtime
