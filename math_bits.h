@@ -219,9 +219,8 @@ public:
     // Calculate the integer multiplier used in bit-shift multiplication
     static constexpr calc_type calc_mult_fact_int()
     {
-        // Compute maximum value that can fit in calc_type after shifting
-        calc_type maxVal = std::numeric_limits<calc_type>::max();
-        maxVal = maxVal >> (std::numeric_limits<calc_type>::digits - bitShifts);
+        // Scale factor is 2^bitShifts (matches the runtime >> bitShifts divide)
+        calc_type maxVal = static_cast<calc_type>(1) << bitShifts;
 
         // Multiply floating-point factor by scaled max value
         long double mult_val_tmp = static_cast<long double>(mult_factor) * static_cast<long double>(maxVal);
