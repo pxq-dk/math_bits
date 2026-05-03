@@ -56,6 +56,25 @@
 	#define OPT_MATH_SHIFT_INLINE
 #endif
 
+// Default options for mult_bitshift, passed as a traits-class type template parameter.
+// Derive from this and override only the members you want to change:
+//
+//     struct fast_safe : mult_bitshift_options {
+//         static constexpr bool deep_test   = false;
+//         static constexpr bool clamp_input = true;
+//     };
+//     using my_scaler = mult_bitshift<0.75, 1000u, uint32_t, uint32_t, fast_safe>;
+//
+// max_error is generalized to uint64_t here so the struct definition does not
+// depend on io_type; the class casts it back to io_type internally.
+struct mult_bitshift_options
+{
+    static constexpr uint64_t max_error      = 1;
+    static constexpr bool     force_inlining = false;
+    static constexpr bool     deep_test      = true;
+    static constexpr bool     clamp_input    = false;
+};
+
 // Template class with unit testing for mult_bitshift class.
 template<typename multType, bool DeepTest = true>
 class unit_test_mult_bitshift
@@ -165,15 +184,33 @@ public:
 
 // Template class for performing multiplication by a floating-point value
 // using integer bit-shifting to approximate the result efficiently.
-template<auto multvalue, auto max_input_value, typename io_type=uint32_t, typename calc_type=uint32_t, io_type max_error=1, bool force_inlining=false, bool deep_test=true, bool clamp_input=false>
+//
+// Options is a traits-class type carrying the optional flags (max_error,
+// force_inlining, deep_test, clamp_input). Pass mult_bitshift_options for
+// defaults, or derive a struct and override only the members you want.
+template<auto multvalue, auto max_input_value,
+         typename io_type=uint32_t, typename calc_type=uint32_t,
+         typename Options = mult_bitshift_options>
 class mult_bitshift
 {
 public:
-	using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, max_error, force_inlining, deep_test, clamp_input>;
+	using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, Options>;
     // Define the type of the multiplier (float, double, or long double)
     using float_type = decltype(multvalue);
     using io_type_t = io_type;
     using calc_type_t = calc_type;
+    using options = Options;
+
+    // Surface the values from the options traits class as plain constants so
+    // the rest of the class can read them with the original short names.
+    static constexpr io_type max_error     = static_cast<io_type>(Options::max_error);
+    static constexpr bool    force_inlining = Options::force_inlining;
+    static constexpr bool    deep_test      = Options::deep_test;
+    static constexpr bool    clamp_input    = Options::clamp_input;
+
+    // Defense-in-depth: max_error must fit in io_type (otherwise the cast above truncates silently).
+    static_assert(Options::max_error <= static_cast<uint64_t>(std::numeric_limits<io_type>::max()),
+                  "Options::max_error does not fit in io_type!");
 
     static constexpr bool inlined = force_inlining;
 
@@ -313,4 +350,33 @@ public:
 
     static_assert(unit_test_mult_bitshift<mult_type, deep_test>::run_test(), "Static unit-testing failed! Consider increasing max_error!");
 };
+
+
+// Helper struct for the mult_bitshift_legacy alias below.
+// Bridges the old positional template arguments into the new traits-class
+// shape expected by mult_bitshift's Options parameter. Not intended for
+// direct use — define your own struct deriving from mult_bitshift_options instead.
+template<uint64_t MaxError, bool ForceInlining, bool DeepTest, bool ClampInput>
+struct mult_bitshift_legacy_options
+{
+    static constexpr uint64_t max_error      = MaxError;
+    static constexpr bool     force_inlining = ForceInlining;
+    static constexpr bool     deep_test      = DeepTest;
+    static constexpr bool     clamp_input    = ClampInput;
+};
+
+// Backwards-compatibility alias preserving the old positional template signature.
+// Existing code that uses mult_bitshift<..., max_error, force_inlining, deep_test, clamp_input>
+// can be migrated by simply renaming to mult_bitshift_legacy<...>. New code should
+// prefer the traits-class form: mult_bitshift<..., MyOpts> with MyOpts deriving from
+// mult_bitshift_options.
+template<auto multvalue, auto max_input_value,
+         typename io_type=uint32_t, typename calc_type=uint32_t,
+         io_type max_error=1, bool force_inlining=false,
+         bool deep_test=true, bool clamp_input=false>
+using mult_bitshift_legacy = mult_bitshift<
+    multvalue, max_input_value, io_type, calc_type,
+    mult_bitshift_legacy_options<static_cast<uint64_t>(max_error), force_inlining, deep_test, clamp_input>
+>;
+
 #endif // __cplusplus
