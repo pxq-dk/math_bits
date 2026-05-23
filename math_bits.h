@@ -70,7 +70,6 @@
 struct mult_bitshift_options
 {
     static constexpr uint64_t max_error      = 1;
-    static constexpr bool     force_inlining = false;
     static constexpr bool     deep_test      = true;
     static constexpr bool     clamp_input    = false;
 };
@@ -204,15 +203,12 @@ public:
     // Surface the values from the options traits class as plain constants so
     // the rest of the class can read them with the original short names.
     static constexpr io_type max_error     = static_cast<io_type>(Options::max_error);
-    static constexpr bool    force_inlining = Options::force_inlining;
     static constexpr bool    deep_test      = Options::deep_test;
     static constexpr bool    clamp_input    = Options::clamp_input;
 
     // Defense-in-depth: max_error must fit in io_type (otherwise the cast above truncates silently).
     static_assert(Options::max_error <= static_cast<uint64_t>(std::numeric_limits<io_type>::max()),
                   "Options::max_error does not fit in io_type!");
-
-    static constexpr bool inlined = force_inlining;
 
     // Calculate the maximum multiplication factor that fits into calc_type
     static constexpr calc_type calc_max_mult()
@@ -291,7 +287,7 @@ public:
         static_cast<io_type>((static_cast<calc_type>(max_input_int) * mult_factor_int) >> bitShifts);
 
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
-    OPT_MATH_SHIFT_INLINE static constexpr inline io_type mult_inlined(io_type input_val)
+    OPT_MATH_SHIFT static constexpr inline io_type mult(io_type input_val)
     {
         // Optional clamp — disappears entirely when clamp_input == false. Uses early return with
         // the precomputed max_output_int to avoid the redundant uxth GCC inserts after a
@@ -304,36 +300,6 @@ public:
         calc_type output_val = static_cast<calc_type>(input_val) * mult_factor_int;
         output_val = output_val >> bitShifts; // Divide by 2^bitShifts
         return static_cast<io_type>(output_val); // Cast back to original type
-    }
-
-    // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
-    OPT_MATH_SHIFT static constexpr inline io_type mult_noninlined(io_type input_val)
-    {
-        // Optional clamp — disappears entirely when clamp_input == false. Uses early return with
-        // the precomputed max_output_int to avoid the redundant uxth GCC inserts after a
-        // conditional value substitution.
-        if constexpr (clamp_input)
-        {
-            if (input_val > max_input_int) return max_output_int;
-        }
-        // Scale the input using integer multiplier
-        calc_type output_val = static_cast<calc_type>(input_val) * mult_factor_int;
-        output_val = output_val >> bitShifts; // Divide by 2^bitShifts
-        return static_cast<io_type>(output_val); // Cast back to original type
-    }
-
-    // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
-    OPT_MATH_SHIFT_INLINE static constexpr inline io_type mult(io_type input_val)
-    {
-    	// Selection between inline/non inline version
-    	if constexpr(inlined)
-		{
-    		return mult_inlined(input_val);
-		}
-    	else
-    	{
-    		return mult_noninlined(input_val);
-    	}
     }
 
     // Overload the * operator to use the optimized multiplication
