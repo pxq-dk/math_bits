@@ -189,9 +189,14 @@ public:
 
     	constexpr std::array<double, elementTestCount> values = linspace<elementTestCount, start, stop>();
 
+    	// The loop below casts each `value` (double) to io_type (unsigned). A negative
+    	// start would make that cast UB on the early samples — and the rest of the test
+    	// class (rounding bias direction, overflow comparisons, max_input_int as `stop`)
+    	// assumes non-negative inputs throughout. Revisit those before relaxing this.
+    	static_assert(start >= 0, "run_test() assumes start >= 0; revisit the loop body and rest of the test class before allowing negative test values.");
+
     	for(auto value : values)
     	{
-    		if(value<0)	value = 0;
     		io_type input =static_cast<io_type>(value);
     		if(!number_ok(input))	return false;
     	}
