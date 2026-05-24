@@ -86,19 +86,19 @@ struct mult_bitshift_options
 };
 
 // Template class with unit testing for mult_bitshift class.
-template<typename multType, bool DeepTest = true>
+template<typename MultType, bool DeepTest = true>
 class unit_test_mult_bitshift
 {
 
 public:
-	using mult_type = multType::mult_type;
-    using float_type = multType::float_type;
-    using io_type = multType::io_type_t;
-    using calc_type = multType::calc_type_t;
+	using mult_type = MultType::mult_type;
+    using float_type = MultType::float_type;
+    using io_type = MultType::io_type;
+    using calc_type = MultType::calc_type;
 
     static constexpr bool test_in_depth{DeepTest};
 
-    static constexpr io_type max_deviation = multType::max_deviation;
+    static constexpr io_type max_deviation = MultType::max_deviation;
     static constexpr uint64_t min_loop_iterations = 100;
     static constexpr uint64_t max_loop_iterations = std::numeric_limits<uint16_t>::max();
     static constexpr uint64_t calc_loop_iterations()
@@ -121,7 +121,7 @@ public:
 
     static constexpr uint64_t loop_iterations = calc_loop_iterations();
 
-    static constexpr float_type mult_factor = multType::mult_factor;        // Floating-point multiplier
+    static constexpr float_type mult_factor = MultType::mult_factor;        // Floating-point multiplier
 
     template <calc_type N, double start, double end>
     static constexpr std::array<double, N> linspace() {
@@ -143,7 +143,7 @@ public:
     	io_type input =static_cast<io_type>(test_value);
 
     	io_type res_expected;
-    	if constexpr (multType::trade_speed_for_precision)
+    	if constexpr (MultType::trade_speed_for_precision)
     	{
     		// Round-to-nearest reference to match mult()'s biased-shift output.
     		res_expected = static_cast<io_type>(
@@ -155,7 +155,7 @@ public:
     		res_expected = static_cast<io_type>(
     			static_cast<long double>(input) * static_cast<long double>(mult_factor));
     	}
-    	io_type res_actual = multType::mult(input);
+    	io_type res_actual = MultType::mult(input);
 
     	io_type res_min,res_max;
 
@@ -182,7 +182,7 @@ public:
     static constexpr bool run_test()
     {
     	constexpr double start = 0;
-    	constexpr double stop = multType::max_input_int;
+    	constexpr double stop = MultType::max_input_int;
     	constexpr calc_type elementTestCount = loop_iterations;
 
     	constexpr std::array<double, elementTestCount> values = linspace<elementTestCount, start, stop>();
@@ -207,17 +207,17 @@ public:
 // deep_test, clamp_input). Pass mult_bitshift_options for defaults, or
 // derive a struct and override only the members you want.
 template<auto multvalue, auto max_input_value,
-         typename io_type=uint32_t, typename calc_type=uint32_t,
+         typename IoType=uint32_t, typename CalcType=uint32_t,
          typename Options = mult_bitshift_options>
 class mult_bitshift
 {
 public:
-	using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, Options>;
+    using io_type = IoType;
+    using calc_type = CalcType;
     // Define the type of the multiplier (float, double, or long double)
     using float_type = decltype(multvalue);
-    using io_type_t = io_type;
-    using calc_type_t = calc_type;
     using options = Options;
+    using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, Options>;
 
     // Surface the values from the options traits class as plain constants so
     // the rest of the class can read them with the original short names.
@@ -383,11 +383,11 @@ struct mult_bitshift_legacy_options : mult_bitshift_options
 // Note: the force_inlining parameter at position 6 is accepted for source
 // compatibility but has no effect — mult() is now unconditionally always_inline.
 template<auto multvalue, auto max_input_value,
-         typename io_type=uint32_t, typename calc_type=uint32_t,
-         io_type max_error=1, bool /*force_inlining (unused)*/ =false,
+         typename IoType=uint32_t, typename CalcType=uint32_t,
+         IoType max_error=1, bool /*force_inlining (unused)*/ =false,
          bool deep_test=true, bool clamp_input=false>
 using mult_bitshift_legacy = mult_bitshift<
-    multvalue, max_input_value, io_type, calc_type,
+    multvalue, max_input_value, IoType, CalcType,
     mult_bitshift_legacy_options<static_cast<uint64_t>(max_error), deep_test, clamp_input>
 >;
 
