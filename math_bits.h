@@ -88,7 +88,8 @@ struct mult_bitshift_options
     static constexpr bool     trade_speed_for_precision = false;
 };
 
-// Template class with unit testing for mult_bitshift class.
+// Template class with unit testing for mult_bitshift. DeepTest=true is the
+// backwards-compat default for external `unit_test_mult_bitshift<some_mult>` callers.
 template<typename MultType, bool DeepTest = true>
 class unit_test_mult_bitshift
 {
