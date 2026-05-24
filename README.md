@@ -107,7 +107,7 @@ All members are `static constexpr`. Override only the ones you want by deriving 
 | Member | Type | Default | Description |
 |---|---|---|---|
 | `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the true floating-point result (in LSB). Generalized to `uint64_t` so the struct doesn't depend on `io_type`; the class casts back to `io_type` internally. Must fit in `io_type`. |
-| `deep_test` | `bool` | `true` | Run the full compile-time test sweep (up to 65535 inputs). Set `false` for a quick smoke test (100 inputs) when compile time matters. |
+| `deep_test` | `bool` | `false` | Default `false` runs a quick 100-sample smoke test at compile time — fast to build. Set `true` for the full sweep (up to 65535 inputs) when you want maximum assurance and can absorb the compile-time cost. |
 | `clamp_input` | `bool` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
 
 ### Legacy positional form: `mult_bitshift_legacy`
@@ -158,7 +158,7 @@ For backwards compatibility, the previous positional signature is preserved as a
 On Cortex-M0/M0+ there is no FPU. A floating-point multiply compiles to a software library call — slow, non-deterministic, and unsuitable for ISRs. By computing the scale factor at compile time and using a single integer multiply + shift at runtime, the hot path becomes 2–3 instructions with deterministic latency.
 
 **Why compile-time unit tests?**
-The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. The sweep is bounded at 65535 samples; if compile time becomes a concern, set `deep_test=false` to drop to a 100-sample smoke test.
+The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. By default (`deep_test=false`) the sweep runs 100 samples — fast to compile and adequate for catching gross errors. Set `deep_test=true` for the full sweep (up to 65535 samples) when you want maximum assurance.
 
 **Why waste one extra type parameter for `calc_type`?**
 The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `io_type` at the end.
