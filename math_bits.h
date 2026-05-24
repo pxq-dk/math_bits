@@ -48,12 +48,13 @@
 
 // Define a compiler-specific optimization hint for functions.
 // Only applies for GCC or Clang. Other compilers ignore it.
+// OPT_MATH_BITS_ prefix scopes these to this library; #undef'd at end of header.
 #if defined(__GNUC__) || defined(__clang__)
-    #define OPT_MATH_SHIFT [[gnu::optimize("Os")]] // Optimize for size
-    #define OPT_MATH_SHIFT_INLINE [[gnu::always_inline, gnu::optimize("Os")]] // Optimize for size
+    #define OPT_MATH_BITS        [[gnu::optimize("Os")]] // Optimize for size
+    #define OPT_MATH_BITS_INLINE [[gnu::always_inline, gnu::optimize("Os")]] // Optimize for size, always inline
 #else
-    #define OPT_MATH_SHIFT
-	#define OPT_MATH_SHIFT_INLINE
+    #define OPT_MATH_BITS
+    #define OPT_MATH_BITS_INLINE
 #endif
 
 // Default options for mult_bitshift, passed as a traits-class type template parameter.
@@ -289,7 +290,7 @@ public:
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting.
     // Unconditionally always_inline so the integer multiply-and-shift fuses into the caller —
     // the previous force_inlining option flag has been retired in favor of this default.
-    OPT_MATH_SHIFT_INLINE static constexpr io_type mult(io_type input_val)
+    OPT_MATH_BITS_INLINE static constexpr io_type mult(io_type input_val)
     {
         // Optional clamp — disappears entirely when clamp_input == false. Uses early return with
         // the precomputed max_output_int to avoid the redundant uxth GCC inserts after a
@@ -305,13 +306,13 @@ public:
     }
 
     // Overload the * operator to use the optimized multiplication
-    OPT_MATH_SHIFT_INLINE constexpr inline io_type operator*(io_type val) const
+    OPT_MATH_BITS_INLINE constexpr inline io_type operator*(io_type val) const
     {
         return mult(val);
     }
 
     // Overload the * operator to use the optimized multiplication
-    OPT_MATH_SHIFT_INLINE friend constexpr inline io_type operator*(io_type val, const mult_type& rhs)
+    OPT_MATH_BITS_INLINE friend constexpr inline io_type operator*(io_type val, const mult_type& rhs)
     {
     	return rhs.mult(val);
     }
@@ -348,5 +349,9 @@ using mult_bitshift_legacy = mult_bitshift<
     multvalue, max_input_value, io_type, calc_type,
     mult_bitshift_legacy_options<static_cast<uint64_t>(max_error), deep_test, clamp_input>
 >;
+
+// Drop the helper macros so they don't leak into translation units that include this header.
+#undef OPT_MATH_BITS
+#undef OPT_MATH_BITS_INLINE
 
 #endif // __cplusplus
