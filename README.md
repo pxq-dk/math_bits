@@ -12,7 +12,7 @@ Header-only C++20 library for multiplying integers by a constant floating-point 
 - **Configurable accuracy** — `max_error` (in the options traits class) sets the allowed deviation from the true floating-point result. Defaults to ±1 LSB.
 - **Compile-time unit tests** — a `static_assert` runs a full test suite at compile time. A broken instantiation will not compile.
 - **Header-only** — single `.h` file, no dependencies beyond the C++ standard library.
-- **Inlining control** — optional `force_inlining` flag (in the options traits class) forces `[[gnu::always_inline]]` on the hot path.
+- **Always-inlined hot path** — `mult()` is unconditionally `[[gnu::always_inline]]`, so the integer multiply-and-shift fuses into the caller with no extra flag.
 
 ---
 
@@ -46,13 +46,12 @@ uint16_t result = scaler * 800;  // same as scale75::mult(800)
 
 ### Customizing options
 
-The optional flags (`max_error`, `force_inlining`, `deep_test`, `clamp_input`) live in a traits-class struct. Derive from `mult_bitshift_options` and override only what you want — everything else stays at its default.
+The optional flags (`max_error`, `deep_test`, `clamp_input`) live in a traits-class struct. Derive from `mult_bitshift_options` and override only what you want — everything else stays at its default.
 
 ```cpp
 struct fast_safe : mult_bitshift_options {
-    static constexpr bool deep_test      = false;   // skip deep compile-time sweep
-    static constexpr bool force_inlining = true;    // inline the hot path
-    static constexpr bool clamp_input    = true;    // clamp inputs > max_input_value
+    static constexpr bool deep_test   = false;   // skip deep compile-time sweep
+    static constexpr bool clamp_input = true;    // clamp inputs > max_input_value
 };
 using scale75_safe = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t, fast_safe>;
 
@@ -63,8 +62,7 @@ Option structs compose — derive from another option struct to extend it:
 
 ```cpp
 struct fast : mult_bitshift_options {
-    static constexpr bool deep_test      = false;
-    static constexpr bool force_inlining = true;
+    static constexpr bool deep_test = false;
 };
 struct fast_with_clamp : fast {
     static constexpr bool clamp_input = true;
@@ -77,9 +75,12 @@ The previous positional-argument signature is preserved as `mult_bitshift_legacy
 
 ```cpp
 // Same configuration as scale75_safe above, in the old positional form.
+// The force_inlining parameter (position 6) is accepted for source
+// compatibility but has no effect — mult() is now unconditionally
+// always_inline.
 using scale75_safe_legacy =
     mult_bitshift_legacy<0.75, (uint16_t)1000, uint16_t, uint32_t,
-                         /*max_error*/1, /*force_inlining*/true,
+                         /*max_error*/1, /*force_inlining (unused)*/false,
                          /*deep_test*/false, /*clamp_input*/true>;
 ```
 
@@ -106,7 +107,6 @@ All members are `static constexpr`. Override only the ones you want by deriving 
 | Member | Type | Default | Description |
 |---|---|---|---|
 | `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the true floating-point result (in LSB). Generalized to `uint64_t` so the struct doesn't depend on `io_type`; the class casts back to `io_type` internally. Must fit in `io_type`. |
-| `force_inlining` | `bool` | `false` | Force `[[gnu::always_inline]]` on the `mult()` function. |
 | `deep_test` | `bool` | `true` | Run the full compile-time test sweep (up to 65535 inputs). Set `false` for a quick smoke test (100 inputs) when compile time matters. |
 | `clamp_input` | `bool` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
 
@@ -121,7 +121,7 @@ For backwards compatibility, the previous positional signature is preserved as a
 | 3 | `io_type` | `uint32_t` |
 | 4 | `calc_type` | `uint32_t` |
 | 5 | `max_error` | `1` |
-| 6 | `force_inlining` | `false` |
+| 6 | `force_inlining` (no effect — kept for source compatibility) | `false` |
 | 7 | `deep_test` | `true` |
 | 8 | `clamp_input` | `false` |
 
@@ -146,10 +146,8 @@ For backwards compatibility, the previous positional signature is preserved as a
 | `max_output_int` | Precomputed `mult(max_input_int)` — the largest value `mult()` will ever return |
 | `max_error` | The configured `max_error` from `Options`, cast to `io_type` |
 | `max_deviation` | Same as `max_error` — kept for backwards compatibility |
-| `force_inlining` | The configured `force_inlining` flag from `Options` |
 | `deep_test` | The configured `deep_test` flag from `Options` |
 | `clamp_input` | The configured `clamp_input` flag from `Options` |
-| `inlined` | Alias for `force_inlining` (used internally to select the inline/non-inline `mult()` path) |
 | `options` | The `Options` traits-class type itself, exposed for inspection |
 
 ---
@@ -175,8 +173,8 @@ Verified by inspecting `arm-none-eabi-g++` output for representative configurati
 - **`mult()` with `calc_type = uint64_t`**: the multiply is widened, so the compiler emits a call to the integer runtime helper `__aeabi_lmul` — still no FPU, still deterministic, but no longer a single instruction. **Prefer `calc_type=uint32_t` on Cortex-M0+ when your inputs and multiplier allow it.**
 - **No FPU instructions** in either case — zero soft-float library calls at runtime.
 - **Compile-time overhead**: parameter generation and unit test run entirely at compile time — zero runtime cost.
-- **`clamp_input=true` + `force_inlining=true`** is the recommended combination when the clamp is needed. The clamp uses an early-return path with a precomputed `max_output_int`, which is slightly larger than the no-clamp body and may exceed GCC's `-Os` auto-inline threshold without `force_inlining=true`. With `force_inlining=true`, the clamp path is fully inlined into the caller (~9 instructions on the common path).
-- **`[[gnu::flatten]]` on user code** is the strongest way to force inlining at a specific call site without touching the library — useful when calling `mult()` from a hot loop where you want every call inlined regardless of the library's `force_inlining` setting.
+- **`clamp_input=true`** is fully inlined into the caller (~9 instructions on the common path) thanks to the unconditional `[[gnu::always_inline]]` on `mult()`. The clamp path uses an early return with a precomputed `max_output_int`.
+- **`[[gnu::flatten]]` on user code** is the strongest way to force transitive inlining at a specific call site — useful when calling `mult()` from a hot loop where you want every nested call (e.g. the operator overloads, or chained scalers) inlined alongside `mult()` itself.
 
 ---
 

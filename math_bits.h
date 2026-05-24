@@ -185,8 +185,8 @@ public:
 // using integer bit-shifting to approximate the result efficiently.
 //
 // Options is a traits-class type carrying the optional flags (max_error,
-// force_inlining, deep_test, clamp_input). Pass mult_bitshift_options for
-// defaults, or derive a struct and override only the members you want.
+// deep_test, clamp_input). Pass mult_bitshift_options for defaults, or
+// derive a struct and override only the members you want.
 template<auto multvalue, auto max_input_value,
          typename io_type=uint32_t, typename calc_type=uint32_t,
          typename Options = mult_bitshift_options>
@@ -286,8 +286,10 @@ public:
     static constexpr io_type max_output_int =
         static_cast<io_type>((static_cast<calc_type>(max_input_int) * mult_factor_int) >> bitShifts);
 
-    // Multiply an input value by the multiplier using integer arithmetic and bit-shifting
-    OPT_MATH_SHIFT static constexpr inline io_type mult(io_type input_val)
+    // Multiply an input value by the multiplier using integer arithmetic and bit-shifting.
+    // Unconditionally always_inline so the integer multiply-and-shift fuses into the caller —
+    // the previous force_inlining option flag has been retired in favor of this default.
+    OPT_MATH_SHIFT_INLINE static constexpr io_type mult(io_type input_val)
     {
         // Optional clamp — disappears entirely when clamp_input == false. Uses early return with
         // the precomputed max_output_int to avoid the redundant uxth GCC inserts after a
@@ -322,13 +324,12 @@ public:
 // Bridges the old positional template arguments into the new traits-class
 // shape expected by mult_bitshift's Options parameter. Not intended for
 // direct use — define your own struct deriving from mult_bitshift_options instead.
-template<uint64_t MaxError, bool ForceInlining, bool DeepTest, bool ClampInput>
+template<uint64_t MaxError, bool DeepTest, bool ClampInput>
 struct mult_bitshift_legacy_options
 {
-    static constexpr uint64_t max_error      = MaxError;
-    static constexpr bool     force_inlining = ForceInlining;
-    static constexpr bool     deep_test      = DeepTest;
-    static constexpr bool     clamp_input    = ClampInput;
+    static constexpr uint64_t max_error   = MaxError;
+    static constexpr bool     deep_test   = DeepTest;
+    static constexpr bool     clamp_input = ClampInput;
 };
 
 // Backwards-compatibility alias preserving the old positional template signature.
@@ -336,13 +337,16 @@ struct mult_bitshift_legacy_options
 // can be migrated by simply renaming to mult_bitshift_legacy<...>. New code should
 // prefer the traits-class form: mult_bitshift<..., MyOpts> with MyOpts deriving from
 // mult_bitshift_options.
+//
+// Note: the force_inlining parameter at position 6 is accepted for source
+// compatibility but has no effect — mult() is now unconditionally always_inline.
 template<auto multvalue, auto max_input_value,
          typename io_type=uint32_t, typename calc_type=uint32_t,
-         io_type max_error=1, bool force_inlining=false,
+         io_type max_error=1, bool /*force_inlining (unused)*/ =false,
          bool deep_test=true, bool clamp_input=false>
 using mult_bitshift_legacy = mult_bitshift<
     multvalue, max_input_value, io_type, calc_type,
-    mult_bitshift_legacy_options<static_cast<uint64_t>(max_error), force_inlining, deep_test, clamp_input>
+    mult_bitshift_legacy_options<static_cast<uint64_t>(max_error), deep_test, clamp_input>
 >;
 
 #endif // __cplusplus
