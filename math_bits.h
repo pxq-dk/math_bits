@@ -137,6 +137,13 @@ public:
         for (calc_type i = 0; i < N; ++i)
             arr[i] = start + i * step;
 
+        // Pin the endpoint exactly. Float (end-start)/(N-1) and i*step don't round-trip in general,
+        // so arr[N-1] could land slightly below `end`. The endpoint is exactly where the
+        // bitshift-multiply's input-scaled error term peaks; missing it by 1 LSB after the
+        // static_cast<io_type>(value) cast would silently weaken the static_assert sweep's
+        // coverage. arr[0] is already exact because `start + 0*step` is exactly `start`.
+        arr[N-1] = end;
+
         return arr;
     }
 
