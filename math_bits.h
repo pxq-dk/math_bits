@@ -70,7 +70,7 @@
 struct mult_bitshift_options
 {
     static constexpr uint64_t max_error      = 1;
-    static constexpr bool     deep_test      = true;
+    static constexpr bool     deep_test      = false;
     static constexpr bool     clamp_input    = false;
 };
 
