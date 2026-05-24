@@ -68,11 +68,21 @@
 //
 // max_error is generalized to uint64_t here so the struct definition does not
 // depend on io_type; the class casts it back to io_type internally.
+//
+// trade_speed_for_precision (default false):
+//   When false, mult() truncates — matches (io_type)(input * mult_factor) with up
+//   to 1 LSB quantization noise vs the float ideal.
+//   When true, mult() adds a half-LSB bias before the shift so the output matches
+//   (io_type)round(input * mult_factor) — exactly, when bitShifts headroom permits.
+//   Cost: one extra add per mult() call (typically 1 cycle on Cortex-M0+). With
+//   sufficient headroom, max_error = 0 will compile-pass; otherwise the static
+//   sweep tells you to widen calc_type or reduce max_input_value.
 struct mult_bitshift_options
 {
-    static constexpr uint64_t max_error      = 1;
-    static constexpr bool     deep_test      = false;
-    static constexpr bool     clamp_input    = false;
+    static constexpr uint64_t max_error                 = 1;
+    static constexpr bool     deep_test                 = false;
+    static constexpr bool     clamp_input               = false;
+    static constexpr bool     trade_speed_for_precision = false;
 };
 
 // Template class with unit testing for mult_bitshift class.
@@ -132,7 +142,19 @@ public:
     	bool success = false;
     	io_type input =static_cast<io_type>(test_value);
 
-    	io_type res_expected = static_cast<io_type>(static_cast<long double>(input) * static_cast<long double>(mult_factor));
+    	io_type res_expected;
+    	if constexpr (multType::trade_speed_for_precision)
+    	{
+    		// Round-to-nearest reference to match mult()'s biased-shift output.
+    		res_expected = static_cast<io_type>(
+    			static_cast<long double>(input) * static_cast<long double>(mult_factor) + 0.5L);
+    	}
+    	else
+    	{
+    		// Truncation reference — matches mult()'s default floor-via-shift behavior.
+    		res_expected = static_cast<io_type>(
+    			static_cast<long double>(input) * static_cast<long double>(mult_factor));
+    	}
     	io_type res_actual = multType::mult(input);
 
     	io_type res_min,res_max;
@@ -165,18 +187,14 @@ public:
 
     	constexpr std::array<double, elementTestCount> values = linspace<elementTestCount, start, stop>();
 
-    	bool success = true;
-
     	for(auto value : values)
     	{
     		if(value<0)	value = 0;
     		io_type input =static_cast<io_type>(value);
-    		bool res = number_ok(input);
-    		if(!res)
-    		{	success = false;	}
+    		if(!number_ok(input))	return false;
     	}
 
-    	return success;
+    	return true;
     }
 };
 
@@ -203,9 +221,10 @@ public:
 
     // Surface the values from the options traits class as plain constants so
     // the rest of the class can read them with the original short names.
-    static constexpr io_type max_error     = static_cast<io_type>(Options::max_error);
-    static constexpr bool    deep_test      = Options::deep_test;
-    static constexpr bool    clamp_input    = Options::clamp_input;
+    static constexpr io_type max_error                  = static_cast<io_type>(Options::max_error);
+    static constexpr bool    deep_test                  = Options::deep_test;
+    static constexpr bool    clamp_input                = Options::clamp_input;
+    static constexpr bool    trade_speed_for_precision  = Options::trade_speed_for_precision;
 
     // Defense-in-depth: max_error must fit in io_type (otherwise the cast above truncates silently).
     static_assert(Options::max_error <= static_cast<uint64_t>(std::numeric_limits<io_type>::max()),
@@ -230,9 +249,12 @@ public:
                       "max_input_value must be smaller than io_type datasize can store!");
 
         // Ensure the result of mult(max_input_value) fits in io_type, with headroom for max_error
+        // (and an extra LSB when trade_speed_for_precision is on, since round-half-up can bump
+        //  the float ideal up by half an LSB at the io_type scale before the cast).
         static_assert(static_cast<long double>(multvalue) * static_cast<long double>(max_input_value)
-                      <= static_cast<long double>(std::numeric_limits<io_type>::max() - max_error),
-                      "multvalue * max_input_value would overflow io_type (no headroom for max_error)!");
+                      <= static_cast<long double>(std::numeric_limits<io_type>::max() - max_error)
+                         - (trade_speed_for_precision ? 1.0L : 0.0L),
+                      "multvalue * max_input_value would overflow io_type (no headroom for max_error or rounding bias)!");
 
         // Calculate the maximum multiplication factor that won't overflow calc_type
         constexpr long double maxVal = static_cast<long double>(std::numeric_limits<calc_type>::max());
@@ -277,10 +299,19 @@ public:
 
     static constexpr calc_type mult_factor_int{calc_mult_fact_int()}; // Integer multiplier
 
-    // Defense-in-depth: max_input_value * mult_factor_int must not overflow calc_type at runtime
+    // Half-LSB rounding bias used by mult() when trade_speed_for_precision is enabled.
+    // Zero when bitShifts == 0 (no shift, no rounding needed) — guards against UB on `1 << -1`.
+    // Referenced by both mult() and the calc_type overflow assert below.
+    static constexpr calc_type round_bias = (bitShifts == 0)
+        ? static_cast<calc_type>(0)
+        : (static_cast<calc_type>(1) << (bitShifts - 1));
+
+    // Defense-in-depth: max_input_value * mult_factor_int (+ round_bias when the rounding
+    // path is active) must not overflow calc_type at runtime
     static_assert(static_cast<long double>(max_input_int) * static_cast<long double>(mult_factor_int)
+                  + (trade_speed_for_precision ? static_cast<long double>(round_bias) : 0.0L)
                   <= static_cast<long double>(std::numeric_limits<calc_type>::max()),
-                  "max_input_value * mult_factor_int would overflow calc_type — choose a wider calc_type or smaller max_input_value!");
+                  "max_input_value * mult_factor_int (+ rounding bias if trade_speed_for_precision) would overflow calc_type — choose a wider calc_type or smaller max_input_value!");
 
     // Precomputed maximum output: mult(max_input_int). Used by the clamp_input early-return path,
     // and exposed publicly so callers can query the maximum value mult() will ever return.
@@ -301,6 +332,13 @@ public:
         }
         // Scale the input using integer multiplier
         calc_type output_val = static_cast<calc_type>(input_val) * mult_factor_int;
+        if constexpr (trade_speed_for_precision)
+        {
+            // Half-LSB bias so the shift below produces round-half-up output —
+            // mult() then exactly matches (io_type)round(input * mult_factor) when
+            // bitShifts headroom permits.
+            output_val += round_bias;
+        }
         output_val = output_val >> bitShifts; // Divide by 2^bitShifts
         return static_cast<io_type>(output_val); // Cast back to original type
     }
@@ -325,12 +363,15 @@ public:
 // Bridges the old positional template arguments into the new traits-class
 // shape expected by mult_bitshift's Options parameter. Not intended for
 // direct use — define your own struct deriving from mult_bitshift_options instead.
+// Inherits from mult_bitshift_options so any future option (e.g. trade_speed_for_precision)
+// is auto-picked-up at its default value without needing maintenance here.
 template<uint64_t MaxError, bool DeepTest, bool ClampInput>
-struct mult_bitshift_legacy_options
+struct mult_bitshift_legacy_options : mult_bitshift_options
 {
     static constexpr uint64_t max_error   = MaxError;
     static constexpr bool     deep_test   = DeepTest;
     static constexpr bool     clamp_input = ClampInput;
+    // trade_speed_for_precision inherited as false from mult_bitshift_options.
 };
 
 // Backwards-compatibility alias preserving the old positional template signature.
