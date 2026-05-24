@@ -140,10 +140,9 @@ public:
         return arr;
     }
 
-    static constexpr bool number_ok(io_type test_value)
+    static constexpr bool number_ok(io_type input)
     {
     	bool success = false;
-    	io_type input =static_cast<io_type>(test_value);
 
     	io_type res_expected;
     	if constexpr (MultType::trade_speed_for_precision)
