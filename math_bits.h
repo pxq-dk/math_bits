@@ -246,9 +246,9 @@ public:
 
         // Ensure max_input_value fits into io_type and calc_type
         static_assert(std::numeric_limits<calc_type>::max() >= max_input_value,
-                      "max_input_value must be smaller than calc_type datasize can store!");
+                      "max_input_value must fit in calc_type!");
         static_assert(std::numeric_limits<io_type>::max() >= max_input_value,
-                      "max_input_value must be smaller than io_type datasize can store!");
+                      "max_input_value must fit in io_type!");
 
         // Ensure the result of mult(max_input_value) fits in io_type, with headroom for max_error
         // (and an extra LSB when trade_speed_for_precision is on, since round-half-up can bump
