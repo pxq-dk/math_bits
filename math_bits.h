@@ -308,8 +308,13 @@ public:
 
     // Precomputed maximum output: mult(max_input_int). Used by the clamp_input early-return path,
     // and exposed publicly so callers can query the maximum value mult() will ever return.
+    // Must mirror mult()'s formula exactly (including the round_bias when
+    // trade_speed_for_precision is on), otherwise the clamp boundary is non-monotonic
+    // (mult(max_input_int+1) would step down from mult(max_input_int)).
     static constexpr io_type max_output_int =
-        static_cast<io_type>((static_cast<calc_type>(max_input_int) * mult_factor_int) >> bitShifts);
+        static_cast<io_type>(
+            ((static_cast<calc_type>(max_input_int) * mult_factor_int)
+                + (trade_speed_for_precision ? round_bias : static_cast<calc_type>(0))) >> bitShifts);
 
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting.
     // Unconditionally always_inline so the integer multiply-and-shift fuses into the caller —
@@ -383,6 +388,22 @@ using mult_bitshift_legacy = mult_bitshift<
     multvalue, max_input_value, IoType, CalcType,
     mult_bitshift_legacy_options<static_cast<uint64_t>(max_error), deep_test, clamp_input>
 >;
+
+// D1 regression — locks in the invariant that the clamp boundary is monotonic
+// when both clamp_input and trade_speed_for_precision are on. Pre-fix, this assert
+// would fire because max_output_int was computed via the truncating formula while
+// mult() applied the rounding bias — the boundary stepped down by 1 LSB.
+namespace math_bits_d1_regression
+{
+    struct opts : mult_bitshift_options
+    {
+        static constexpr bool clamp_input               = true;
+        static constexpr bool trade_speed_for_precision = true;
+    };
+    using probe = mult_bitshift<0.7, 10u, uint8_t, uint16_t, opts>;
+    static_assert(probe::mult(probe::max_input_int) == probe::max_output_int,
+        "D1 regression: mult(max_input_int) must equal max_output_int — clamp boundary must not step down.");
+}
 
 // Drop the helper macros so they don't leak into translation units that include this header.
 #undef OPT_MATH_BITS
