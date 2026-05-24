@@ -38,13 +38,16 @@
  */
 
 #pragma once
+
+#ifndef __cplusplus
+#error "math_bits.h is C++-only; include from a C++ translation unit."
+#endif
+
 #include <limits>
 #include <type_traits>
 #include <cstdint>
 #include <bit>
 #include <array>
-
-#ifdef __cplusplus
 
 // Define a compiler-specific optimization hint for functions.
 // Only applies for GCC or Clang. Other compilers ignore it.
@@ -394,5 +397,3 @@ using mult_bitshift_legacy = mult_bitshift<
 // Drop the helper macros so they don't leak into translation units that include this header.
 #undef OPT_MATH_BITS
 #undef OPT_MATH_BITS_INLINE
-
-#endif // __cplusplus
