@@ -84,7 +84,7 @@ using scale75_safe_legacy =
                          /*deep_test*/false, /*clamp_input*/true>;
 ```
 
-New code should prefer the traits-class form — the legacy form is kept only to avoid breaking existing instantiations.
+New code should prefer the traits-class form — the legacy form is kept only to avoid breaking existing instantiations. Note that the legacy form preserves the pre-refactor default `deep_test=true`, while the traits-class form's default is `false`; set it explicitly if the difference matters.
 
 ---
 
@@ -112,7 +112,7 @@ All members are `static constexpr`. Override only the ones you want by deriving 
 
 ### Legacy positional form: `mult_bitshift_legacy`
 
-For backwards compatibility, the previous positional signature is preserved as a separate alias. Identical behavior to the traits-class form — pick whichever style suits the call site:
+For backwards compatibility, the previous positional signature is preserved as a separate alias. The legacy form's defaults match the pre-refactor `mult_bitshift` defaults — notably `deep_test=true` (full 65535-sample sweep). The new traits-class form's `deep_test` default was deliberately changed to `false` for faster compiles; if you want the deep sweep, either use the legacy form or override `deep_test=true` in your options struct.
 
 | Position | Parameter | Default |
 |---|---|---|
