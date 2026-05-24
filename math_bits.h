@@ -142,8 +142,6 @@ public:
 
     static constexpr bool number_ok(io_type input)
     {
-    	bool success = false;
-
     	io_type res_expected;
     	if constexpr (MultType::trade_speed_for_precision)
     	{
@@ -157,28 +155,16 @@ public:
     		res_expected = static_cast<io_type>(
     			static_cast<long double>(input) * static_cast<long double>(mult_factor));
     	}
-    	io_type res_actual = MultType::mult(input);
+    	const io_type res_actual = MultType::mult(input);
 
-    	io_type res_min,res_max;
+    	const io_type res_min = (res_expected > max_deviation)
+    		? (res_expected - max_deviation)
+    		: io_type{0};
+    	const io_type res_max = (res_expected < std::numeric_limits<io_type>::max() - max_deviation)
+    		? (res_expected + max_deviation)
+    		: std::numeric_limits<io_type>::max();
 
-    	if(res_expected>max_deviation)
-    	{	res_min = res_expected-max_deviation;	}
-    	else
-    	{	res_min = 0;	}
-
-    	if(res_expected< (std::numeric_limits<io_type>::max() -max_deviation))
-    	{	res_max = res_expected+max_deviation;	}
-    	else
-    	{	res_max = std::numeric_limits<io_type>::max();		}
-
-    	if(res_min>res_actual)
-    	{	success = false;	}
-    	else if(res_max<res_actual)
-    	{	success = false;	}
-    	else
-    	{	success = true;	}
-
-    	return success;
+    	return (res_actual >= res_min) && (res_actual <= res_max);
     }
 
     static constexpr bool run_test()
