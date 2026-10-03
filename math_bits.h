@@ -80,12 +80,20 @@
 //   Cost: one extra add per mult() call (typically 1 cycle on Cortex-M0+). With
 //   sufficient headroom, max_error = 0 will compile-pass; otherwise the static
 //   sweep tells you to widen calc_type or reduce max_input_value.
+//
+// min_output_range (default 1):
+//   Minimum required output range, i.e. multvalue * max_input_value must be at least
+//   this many LSBs. Output resolution is 1 LSB of io_type, so the relative resolution at
+//   full scale is ~1/(multvalue * max_input_value). Raise it to get a compile error when
+//   the output would be too coarse, e.g. 100 for >= 1% full-scale resolution.
+//   The default 1 only rejects scalers whose every output would be below 1 LSB.
 struct mult_bitshift_options
 {
     static constexpr uint64_t max_error                 = 1;
     static constexpr bool     deep_test                 = false;
     static constexpr bool     clamp_input               = false;
     static constexpr bool     trade_speed_for_precision = false;
+    static constexpr uint64_t min_output_range          = 1;
 };
 
 // Template class with unit testing for mult_bitshift. DeepTest=true is the
@@ -226,6 +234,7 @@ public:
     static constexpr bool    deep_test                  = Options::deep_test;
     static constexpr bool    clamp_input                = Options::clamp_input;
     static constexpr bool    trade_speed_for_precision  = Options::trade_speed_for_precision;
+    static constexpr uint64_t min_output_range          = Options::min_output_range;
 
     // Defense-in-depth: max_error must fit in io_type (otherwise the cast above truncates silently).
     static_assert(Options::max_error <= static_cast<uint64_t>(std::numeric_limits<io_type>::max()),
@@ -256,6 +265,23 @@ public:
                       <= static_cast<long double>(std::numeric_limits<io_type>::max() - max_error)
                          - (trade_speed_for_precision ? 1.0L : 0.0L),
                       "multvalue * max_input_value would overflow io_type (no headroom for max_error or rounding bias)!");
+
+        // Reject scalers: if the product is < 1, every valid input maps to an output
+        // below 1 LSB (always 0 when truncating; at most 0/1 with trade_speed_for_precision).
+        // Checked before the division below, which cannot handle a product < 1 and would
+        // otherwise fail with an internal "Division result too big" error.
+        static_assert(static_cast<long double>(multvalue) * static_cast<long double>(max_input_value) >= 1.0L,
+                      "multvalue * max_input_value < 1: every ideal output would be below 1 LSB. "
+                      "Scale the result up (e.g. output in milli-units) or raise max_input_value.");
+
+        // Opt-in resolution requirement (Options::min_output_range). The hard limit above
+        // stays separate so a min_output_range of 0 cannot bypass it; values <= 1 are already
+        // covered by it, so they are skipped here to avoid a duplicate diagnostic.
+        static_assert(min_output_range <= 1
+                      || static_cast<long double>(multvalue) * static_cast<long double>(max_input_value)
+                         >= static_cast<long double>(min_output_range),
+                      "multvalue * max_input_value < Options::min_output_range: output too coarse. "
+                      "Scale the result up (e.g. output in milli-units) or lower min_output_range.");
 
         // Calculate the maximum multiplication factor that won't overflow calc_type
         constexpr long double maxVal = static_cast<long double>(std::numeric_limits<calc_type>::max());

@@ -109,6 +109,7 @@ All members are `static constexpr`. Override only the ones you want by deriving 
 | `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the true floating-point result (in LSB). Generalized to `uint64_t` so the struct doesn't depend on `io_type`; the class casts back to `io_type` internally. Must fit in `io_type`. |
 | `deep_test` | `bool` | `false` | Default `false` runs a quick 100-sample smoke test at compile time — fast to build. Set `true` for the full sweep (up to 65535 inputs) when you want maximum assurance and can absorb the compile-time cost. |
 | `clamp_input` | `bool` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
+| `min_output_range` | `uint64_t` | `1` | Minimum required output range: `multvalue * max_input_value` must be at least this many LSBs, otherwise the build fails. Output resolution is 1 LSB of `io_type`, so relative full-scale resolution is ~`1/(multvalue * max_input_value)` — e.g. set `100` to require ≥ 1%. The default `1` only rejects scalers whose every output would be below 1 LSB (which cannot compile anyway). Compile-time only, zero runtime cost. |
 
 ### Legacy positional form: `mult_bitshift_legacy`
 
@@ -148,6 +149,7 @@ For backwards compatibility, the previous positional signature is preserved as a
 | `max_deviation` | Same as `max_error` — kept for backwards compatibility |
 | `deep_test` | The configured `deep_test` flag from `Options` |
 | `clamp_input` | The configured `clamp_input` flag from `Options` |
+| `min_output_range` | The configured `min_output_range` from `Options` |
 | `options` | The `Options` traits-class type itself, exposed for inspection |
 
 ---
