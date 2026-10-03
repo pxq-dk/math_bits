@@ -46,6 +46,7 @@
 #include <limits>
 #include <type_traits>
 #include <cstdint>
+#include <cstddef>
 #include <bit>
 #include <array>
 
@@ -112,30 +113,25 @@ public:
 
     static constexpr io_type max_deviation = MultType::max_deviation;
     static constexpr uint64_t min_loop_iterations = 100;
-    static constexpr uint64_t max_loop_iterations = std::numeric_limits<uint16_t>::max();
-    static constexpr uint64_t calc_loop_iterations()
+    // 65536 = every uint16_t input, so a full 16-bit range is tested exhaustively.
+    static constexpr uint64_t max_loop_iterations = static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()) + 1;
+    // Sample count for the sweep over [0, max_input_int]. Based on the input range rather than
+    // io_type's range: when max_input_int + 1 fits under the cap, every input is tested exactly
+    // once (linspace step is then exactly 1); otherwise the range is sampled.
+    static constexpr std::size_t calc_loop_iterations()
     {
-    	constexpr uint64_t io_type_max = static_cast<uint64_t>(std::numeric_limits<io_type>::max());
+    	constexpr uint64_t input_count = static_cast<uint64_t>(MultType::max_input_int) + 1;
+    	constexpr uint64_t cap = test_in_depth ? max_loop_iterations : min_loop_iterations;
 
-    	uint64_t iterations = 0;
-    	if constexpr (io_type_max >= max_loop_iterations)
-    	{	iterations = max_loop_iterations;    	}
-    	else
-    	{	iterations = io_type_max + 1;	}
-
-        if constexpr(!test_in_depth)
-    	{
-        	iterations = min_loop_iterations;
-    	}
-
-        return iterations;
+    	return static_cast<std::size_t>(input_count < cap ? input_count : cap);
     }
 
-    static constexpr uint64_t loop_iterations = calc_loop_iterations();
+    static constexpr std::size_t loop_iterations = calc_loop_iterations();
 
     static constexpr float_type mult_factor = MultType::mult_factor;        // Floating-point multiplier
 
-    template <calc_type N, double start, double end>
+    // N is std::size_t, not calc_type: a narrow calc_type (e.g. uint8_t) would truncate the count.
+    template <std::size_t N, double start, double end>
     static constexpr std::array<double, N> linspace() {
         static_assert(N >= 2, "linspace requires N >= 2 (need at least two points to define a spacing)");
 
@@ -143,7 +139,7 @@ public:
 
         const double step = (end - start) / (N - 1);
 
-        for (calc_type i = 0; i < N; ++i)
+        for (std::size_t i = 0; i < N; ++i)
             arr[i] = start + i * step;
 
         // Pin the endpoint exactly. Float (end-start)/(N-1) and i*step don't round-trip in general,
@@ -187,7 +183,7 @@ public:
     {
     	constexpr double start = 0;
     	constexpr double stop = MultType::max_input_int;
-    	constexpr calc_type elementTestCount = loop_iterations;
+    	constexpr std::size_t elementTestCount = loop_iterations;
 
     	constexpr std::array<double, elementTestCount> values = linspace<elementTestCount, start, stop>();
 

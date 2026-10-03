@@ -107,13 +107,13 @@ All members are `static constexpr`. Override only the ones you want by deriving 
 | Member | Type | Default | Description |
 |---|---|---|---|
 | `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the true floating-point result (in LSB). Generalized to `uint64_t` so the struct doesn't depend on `io_type`; the class casts back to `io_type` internally. Must fit in `io_type`. |
-| `deep_test` | `bool` | `false` | Default `false` runs a quick 100-sample smoke test at compile time — fast to build. Set `true` for the full sweep (up to 65535 inputs) when you want maximum assurance and can absorb the compile-time cost. |
+| `deep_test` | `bool` | `false` | Default `false` runs a quick smoke test of up to 100 samples at compile time — fast to build. Set `true` for the full sweep (up to 65536 samples) when you want maximum assurance and can absorb the compile-time cost. |
 | `clamp_input` | `bool` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
 | `min_output_range` | `uint64_t` | `1` | Minimum required output range: `multvalue * max_input_value` must be at least this many LSBs, otherwise the build fails. Output resolution is 1 LSB of `io_type`, so relative full-scale resolution is ~`1/(multvalue * max_input_value)` — e.g. set `100` to require ≥ 1%. The default `1` only rejects scalers whose every output would be below 1 LSB (which cannot compile anyway). Compile-time only, zero runtime cost. |
 
 ### Legacy positional form: `mult_bitshift_legacy`
 
-For backwards compatibility, the previous positional signature is preserved as a separate alias. The legacy form's defaults match the pre-refactor `mult_bitshift` defaults — notably `deep_test=true` (full 65535-sample sweep). The new traits-class form's `deep_test` default was deliberately changed to `false` for faster compiles; if you want the deep sweep, either use the legacy form or override `deep_test=true` in your options struct.
+For backwards compatibility, the previous positional signature is preserved as a separate alias. The legacy form's defaults match the pre-refactor `mult_bitshift` defaults — notably `deep_test=true` (full sweep of up to 65536 samples). The new traits-class form's `deep_test` default was deliberately changed to `false` for faster compiles; if you want the deep sweep, either use the legacy form or override `deep_test=true` in your options struct.
 
 | Position | Parameter | Default |
 |---|---|---|
@@ -160,7 +160,7 @@ For backwards compatibility, the previous positional signature is preserved as a
 On Cortex-M0/M0+ there is no FPU. A floating-point multiply compiles to a software library call — slow, non-deterministic, and unsuitable for ISRs. By computing the scale factor at compile time and using a single integer multiply + shift at runtime, the hot path becomes 2–3 instructions with deterministic latency.
 
 **Why compile-time unit tests?**
-The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. By default (`deep_test=false`) the sweep runs 100 samples — fast to compile and adequate for catching gross errors. Set `deep_test=true` for the full sweep (up to 65535 samples) when you want maximum assurance.
+The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. By default (`deep_test=false`) the sweep runs up to 100 samples — fast to compile and adequate for catching gross errors. Set `deep_test=true` for the full sweep (up to 65536 samples) when you want maximum assurance. The sample count is capped by the input range: when `max_input_value + 1` is at or below the cap, every input from 0 to `max_input_value` is tested exactly once (exhaustive). `max_input_value` itself is always tested.
 
 **Why waste one extra type parameter for `calc_type`?**
 The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `io_type` at the end.
