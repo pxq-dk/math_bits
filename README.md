@@ -162,6 +162,19 @@ On Cortex-M0/M0+ there is no FPU. A floating-point multiply compiles to a softwa
 **Why compile-time unit tests?**
 The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. By default (`deep_test=false`) the sweep runs up to 100 samples — fast to compile and adequate for catching gross errors. Set `deep_test=true` for the full sweep (up to 65536 samples) when you want maximum assurance. The sample count is capped by the input range: when `max_input_value + 1` is at or below the cap, every input from 0 to `max_input_value` is tested exactly once (exhaustive). `max_input_value` itself is always tested.
 
+**Error analysis and targeted gray-zone check**
+Sampling alone can miss inputs: in large ranges only a fraction of inputs reach the worst-case error. So before the sweep, the error is analysed. `mult(x)` and the reference differ internally by `x·e`, where `e = mult_factor_int / 2^bitShifts − multvalue` is the quantization error of the integer factor. The output error at `x` is therefore `floor(x·|e|)` or `ceil(x·|e|)`, and with `Δ = max_input_value·|e|`:
+
+| Case | Condition | Result |
+|---|---|---|
+| Proven OK | `ceil(Δ) ≤ max_error` | Passes — no input can exceed `max_error` |
+| Proven FAIL | `floor(Δ) > max_error` | Fails — `max_input_value` is a counterexample |
+| Gray zone | otherwise | Targeted check (below) |
+
+In the gray zone only inputs with `x·|e| > max_error` can fail, and only by exactly 1 LSB. Within one output level the input closest to the level boundary has the largest error, so one candidate per level is tested — starting at `max_input_value`, where the error is largest, and walking down. Up to 65536 candidates are tested with `deep_test=true` (1024 otherwise); when all candidates fit in that budget, the check is exhaustive and exact. Otherwise the configuration passes if the tested candidates pass — a remaining miss is bounded to `max_error + 1`.
+
+The broad sweep still runs afterwards as an independent cross-check of the implementation.
+
 **Why waste one extra type parameter for `calc_type`?**
 The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `io_type` at the end.
 

@@ -152,21 +152,19 @@ public:
         return arr;
     }
 
+    // Floating-point reference result for `input`: floor(input * mult_factor + bias),
+    // bias = 0.5 when trade_speed_for_precision (round-to-nearest), else 0 (truncation).
+    static constexpr long double reference_bias = MultType::trade_speed_for_precision ? 0.5L : 0.0L;
+
+    static constexpr io_type reference(io_type input)
+    {
+    	return static_cast<io_type>(
+    		static_cast<long double>(input) * static_cast<long double>(mult_factor) + reference_bias);
+    }
+
     static constexpr bool number_ok(io_type input)
     {
-    	io_type res_expected;
-    	if constexpr (MultType::trade_speed_for_precision)
-    	{
-    		// Round-to-nearest reference to match mult()'s biased-shift output.
-    		res_expected = static_cast<io_type>(
-    			static_cast<long double>(input) * static_cast<long double>(mult_factor) + 0.5L);
-    	}
-    	else
-    	{
-    		// Truncation reference — matches mult()'s default floor-via-shift behavior.
-    		res_expected = static_cast<io_type>(
-    			static_cast<long double>(input) * static_cast<long double>(mult_factor));
-    	}
+    	const io_type res_expected = reference(input);
     	const io_type res_actual = MultType::mult(input);
 
     	const io_type res_min = (res_expected > max_deviation)
@@ -201,6 +199,108 @@ public:
 
     	return true;
     }
+
+    // ---- Error analysis + targeted gray-zone check ---------------------------------------
+    //
+    // mult(x) = floor(x*M/2^s + b) and reference(x) = floor(x*f + b) share the same bias b, so
+    // they differ internally by delta(x) = x*e, with e = M/2^s - f (quantization error of the
+    // integer factor). The output error at x is therefore floor(x*|e|) or ceil(x*|e|), and with
+    // worst_deviation = max_input * |e|:
+    //   - ceil(worst_deviation) <= max_error  -> proven OK for every input (no check needed)
+    //   - floor(worst_deviation) > max_error  -> proven FAIL; max_input itself is a counterexample
+    //   - otherwise (gray zone)               -> only x > max_error/|e| can exceed max_error,
+    //     and only by exactly 1 LSB. Within one output level n (= reference(x)) the input closest
+    //     to the level boundary dominates: the largest x of the level when e > 0 (mult runs
+    //     high), the smallest x when e < 0 (mult runs low). So one candidate per level is exact.
+    //
+    // Not applied when bitShifts == 0 with trade_speed_for_precision: round_bias is then 0
+    // while the reference still adds 0.5, so the shared-bias premise does not hold.
+    static constexpr bool analysis_applies =
+    	!(MultType::trade_speed_for_precision && MultType::bitShifts == 0);
+
+    static constexpr long double quant_error =
+    	static_cast<long double>(MultType::mult_factor_int)
+    		/ static_cast<long double>(static_cast<uint64_t>(1) << MultType::bitShifts)
+    	- static_cast<long double>(mult_factor);
+    static constexpr long double abs_quant_error = quant_error < 0 ? -quant_error : quant_error;
+    static constexpr long double worst_deviation =
+    	static_cast<long double>(MultType::max_input_int) * abs_quant_error;
+
+    // Small relative margin so values within float rounding of an integer go to the gray zone,
+    // where they are decided by actual evaluation instead of by the analysis alone.
+    static constexpr bool proven_ok = analysis_applies
+    	&& worst_deviation * (1.0L + 1e-9L) <= static_cast<long double>(max_deviation);
+
+    // Gray-zone candidate budget: up to 65536 with deep_test, else the 1024 candidates with the
+    // largest expected error (closest to max_input, where the violation window is widest).
+    // Separate from the 100-sample quick sweep: it only runs in the (rare) gray zone, so a
+    // larger quick budget costs little compile time where it is not needed.
+    static constexpr uint64_t gray_zone_quick_budget = 1024;
+    static constexpr uint64_t gray_zone_budget = test_in_depth ? max_loop_iterations : gray_zone_quick_budget;
+
+    // The endpoint has the largest |delta|; if it fails, the configuration is proven bad.
+    static constexpr bool endpoint_ok() { return number_ok(MultType::max_input_int); }
+
+    // Smallest x in [0, max_input] with reference(x) >= n. The float guess is only a starting
+    // point; the loops correct it against reference(), which is monotonic in x.
+    static constexpr uint64_t level_start(uint64_t n)
+    {
+    	constexpr uint64_t x_max = MultType::max_input_int;
+    	const long double g = (static_cast<long double>(n) - reference_bias) / static_cast<long double>(mult_factor);
+    	uint64_t x = 0;
+    	if (g > 0)
+    	{
+    		const uint64_t t = (g >= static_cast<long double>(x_max)) ? x_max : static_cast<uint64_t>(g);
+    		x = (static_cast<long double>(t) < g && t < x_max) ? t + 1 : t;   // ceil, clamped
+    	}
+    	while (x > 0 && reference(static_cast<io_type>(x - 1)) >= n) --x;
+    	while (x < x_max && reference(static_cast<io_type>(x)) < n) ++x;
+    	return x;
+    }
+
+    static constexpr bool gray_zone_ok()
+    {
+    	if constexpr (!analysis_applies || proven_ok) return true;
+    	else
+    	{
+    		constexpr uint64_t x_max = MultType::max_input_int;
+    		// Inputs with x*|e| <= max_error cannot violate; margin keeps float rounding safe.
+    		constexpr long double x_crit = static_cast<long double>(max_deviation) / abs_quant_error;
+    		constexpr uint64_t x_lo = (x_crit * (1.0L - 1e-9L) >= static_cast<long double>(x_max))
+    			? x_max : static_cast<uint64_t>(x_crit * (1.0L - 1e-9L));
+
+    		uint64_t checked = 0;
+    		if constexpr (quant_error > 0)
+    		{
+    			// Largest x of each level, walking down from max_input.
+    			uint64_t x = x_max;
+    			while (checked < gray_zone_budget && x >= x_lo)
+    			{
+    				if (!number_ok(static_cast<io_type>(x))) return false;
+    				++checked;
+    				const uint64_t start = level_start(reference(static_cast<io_type>(x)));
+    				if (start == 0 || start - 1 < x_lo) break;
+    				x = start - 1;
+    			}
+    		}
+    		else
+    		{
+    			// Smallest x of each level, walking down from the top level.
+    			uint64_t x = level_start(reference(static_cast<io_type>(x_max)));
+    			while (checked < gray_zone_budget && x >= x_lo)
+    			{
+    				if (!number_ok(static_cast<io_type>(x))) return false;
+    				++checked;
+    				if (x == 0 || x - 1 < x_lo) break;
+    				x = level_start(reference(static_cast<io_type>(x - 1)));
+    			}
+    		}
+    		return true;
+    	}
+    }
+
+    static constexpr bool endpoint_passed  = endpoint_ok();
+    static constexpr bool gray_zone_passed = gray_zone_ok();
 };
 
 
@@ -383,7 +483,16 @@ public:
     	return rhs.mult(val);
     }
 
-    static_assert(unit_test_mult_bitshift<mult_type, deep_test>::run_test(), "Static unit-testing failed! Consider increasing max_error!");
+    // Compile-time self-test, in order: endpoint (proven-fail case), targeted gray-zone check
+    // from the error analysis, then the broad sweep as an independent cross-check. Later checks
+    // are skipped once an earlier one has failed, so only the most specific error is reported.
+    using self_test = unit_test_mult_bitshift<mult_type, deep_test>;
+    static_assert(self_test::endpoint_passed,
+                  "mult(max_input_value) exceeds max_error: the error grows with the input, so the range is too large for this max_error. Increase max_error, widen calc_type or reduce max_input_value!");
+    static_assert(!self_test::endpoint_passed || self_test::gray_zone_passed,
+                  "Targeted error-analysis check failed: inputs near max_input_value exceed max_error by 1 LSB. Increase max_error, widen calc_type or reduce max_input_value!");
+    static_assert(!self_test::endpoint_passed || !self_test::gray_zone_passed || self_test::run_test(),
+                  "Static unit-testing failed! Consider increasing max_error!");
 };
 
 
