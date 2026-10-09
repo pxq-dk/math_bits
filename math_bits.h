@@ -61,6 +61,19 @@
     #define OPT_MATH_BITS_INLINE
 #endif
 
+// Split 32x64 multiply for a 64-bit calc_type on cores without a 32x32->64 multiply instruction
+// (ARMv6-M: Cortex-M0/M0+/M1, ARMv8-M Baseline: Cortex-M23). There a plain uint64_t multiply
+// becomes a call to the libgcc routine __aeabi_lmul; mult() uses 32-bit operations instead.
+// Results are bit-identical either way. Predefine to 0 or 1 to override the detection
+// (e.g. 1 to exercise the split path in host-side tests).
+#ifndef MATH_BITS_SPLIT_MUL64
+    #if defined(__ARM_ARCH_6M__) || defined(__ARM_ARCH_8M_BASE__)
+        #define MATH_BITS_SPLIT_MUL64 1
+    #else
+        #define MATH_BITS_SPLIT_MUL64 0
+    #endif
+#endif
+
 // Default options for mult_bitshift, passed as a traits-class type template parameter.
 // Derive from this and override only the members you want to change:
 //
@@ -446,6 +459,61 @@ public:
             ((static_cast<calc_type>(max_input_int) * mult_factor_int)
                 + (trade_speed_for_precision ? round_bias : static_cast<calc_type>(0))) >> bitShifts);
 
+    // Split multiply is used for a 64-bit calc_type with io_type <= 32 bits when
+    // MATH_BITS_SPLIT_MUL64 is set (auto-detected for ARMv6-M / ARMv8-M Baseline).
+    static constexpr bool use_split_mul64 = (MATH_BITS_SPLIT_MUL64 != 0)
+        && std::numeric_limits<calc_type>::digits == 64
+        && std::numeric_limits<io_type>::digits <= 32;
+
+    // (x * mult_factor_int [+ round_bias]) >> bitShifts for a 64-bit calc_type, using 32-bit
+    // operations only. With M = M_hi*2^32 + M_lo:  x*M = x*M_lo + (x*M_hi)*2^32, computed
+    // modulo 2^64 exactly like the plain uint64_t expression (so bit-identical, also for inputs
+    // above max_input_value):
+    //   - x*M_hi only contributes its low 32 bits -> one 32-bit multiply
+    //   - x*M_lo needs all 64 bits -> 16x16 partial products (2 when io_type <= 16 bits, else 4)
+    // mult_factor_int is a compile-time constant, so zero parts fold away (0.75 -> a single muls).
+    OPT_MATH_BITS_INLINE static constexpr io_type mult_split64(io_type input_val)
+    {
+        constexpr uint32_t m_lo = static_cast<uint32_t>(mult_factor_int);
+        constexpr uint32_t m_hi = static_cast<uint32_t>(static_cast<uint64_t>(mult_factor_int) >> 32);
+        constexpr uint32_t ml = m_lo & 0xFFFFu;
+        constexpr uint32_t mh = m_lo >> 16;
+        const uint32_t x = static_cast<uint32_t>(input_val);
+
+        // x * M_lo as the 64-bit pair hi:lo
+        uint32_t lo, hi;
+        if constexpr (std::numeric_limits<io_type>::digits <= 16)
+        {
+            const uint32_t ll = x * ml, lh = x * mh;
+            const uint32_t mid = (ll >> 16) + (lh & 0xFFFFu);
+            hi = (lh >> 16) + (mid >> 16);
+            lo = (mid << 16) | (ll & 0xFFFFu);
+        }
+        else
+        {
+            const uint32_t xl = x & 0xFFFFu, xh = x >> 16;
+            const uint32_t ll = xl * ml, lh = xl * mh, hl = xh * ml;
+            const uint32_t mid = (ll >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu); // <= 3*0xFFFF, no overflow
+            hi = xh * mh + (lh >> 16) + (hl >> 16) + (mid >> 16);
+            lo = (mid << 16) | (ll & 0xFFFFu);
+        }
+        hi += x * m_hi; // low 32 bits of x*M_hi, shifted up by 32 (mod 2^64)
+
+        if constexpr (trade_speed_for_precision)
+        {
+            constexpr uint32_t b_lo = static_cast<uint32_t>(round_bias);
+            constexpr uint32_t b_hi = static_cast<uint32_t>(static_cast<uint64_t>(round_bias) >> 32);
+            lo += b_lo;
+            hi += b_hi + (lo < b_lo ? 1u : 0u); // + carry out of the low word
+        }
+
+        // The output fits io_type (<= 32 bits), so multvalue * max_input_value < 2^32 and
+        // max_mult_fact = 2^64 / (multvalue * max_input_value) > 2^32: the shift always drops the
+        // whole low word, and only hi is needed.
+        static_assert(bitShifts >= 32, "split multiply assumes bitShifts >= 32 (guaranteed for io_type <= 32 bits)");
+        return static_cast<io_type>(hi >> (bitShifts - 32));
+    }
+
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting.
     // Unconditionally always_inline so the integer multiply-and-shift fuses into the caller —
     // the previous force_inlining option flag has been retired in favor of this default.
@@ -458,17 +526,24 @@ public:
         {
             if (input_val > max_input_int) return max_output_int;
         }
-        // Scale the input using integer multiplier
-        calc_type output_val = static_cast<calc_type>(input_val) * mult_factor_int;
-        if constexpr (trade_speed_for_precision)
+        if constexpr (use_split_mul64)
         {
-            // Half-LSB bias so the shift below produces round-half-up output —
-            // mult() then exactly matches (io_type)round(input * mult_factor) when
-            // bitShifts headroom permits.
-            output_val += round_bias;
+            return mult_split64(input_val);
         }
-        output_val = output_val >> bitShifts; // Divide by 2^bitShifts
-        return static_cast<io_type>(output_val); // Cast back to original type
+        else
+        {
+            // Scale the input using integer multiplier
+            calc_type output_val = static_cast<calc_type>(input_val) * mult_factor_int;
+            if constexpr (trade_speed_for_precision)
+            {
+                // Half-LSB bias so the shift below produces round-half-up output —
+                // mult() then exactly matches (io_type)round(input * mult_factor) when
+                // bitShifts headroom permits.
+                output_val += round_bias;
+            }
+            output_val = output_val >> bitShifts; // Divide by 2^bitShifts
+            return static_cast<io_type>(output_val); // Cast back to original type
+        }
     }
 
     // Overload the * operator to use the optimized multiplication
