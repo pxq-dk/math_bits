@@ -50,15 +50,12 @@
 #include <bit>
 #include <array>
 
-// Define a compiler-specific optimization hint for functions.
-// Only applies for GCC or Clang. Other compilers ignore it.
-// OPT_MATH_BITS_ prefix scopes these to this library; #undef'd at end of header.
+// Force inlining of the hot path so the integer multiply-and-shift fuses into the caller.
+// GCC/Clang only (GNU attribute); other compilers ignore it. #undef'd at end of header.
 #if defined(__GNUC__) || defined(__clang__)
-    #define OPT_MATH_BITS        [[gnu::optimize("Os")]] // Optimize for size
-    #define OPT_MATH_BITS_INLINE [[gnu::always_inline, gnu::optimize("Os")]] // Optimize for size, always inline
+    #define MATH_BITS_ALWAYS_INLINE [[gnu::always_inline]]
 #else
-    #define OPT_MATH_BITS
-    #define OPT_MATH_BITS_INLINE
+    #define MATH_BITS_ALWAYS_INLINE
 #endif
 
 // Split 32x64 multiply for a 64-bit calc_type on cores without a 32x32->64 multiply instruction
@@ -472,7 +469,7 @@ public:
     //   - x*M_hi only contributes its low 32 bits -> one 32-bit multiply
     //   - x*M_lo needs all 64 bits -> 16x16 partial products (2 when io_type <= 16 bits, else 4)
     // mult_factor_int is a compile-time constant, so zero parts fold away (0.75 -> a single muls).
-    OPT_MATH_BITS_INLINE static constexpr io_type mult_split64(io_type input_val)
+    MATH_BITS_ALWAYS_INLINE static constexpr io_type mult_split64(io_type input_val)
     {
         constexpr uint32_t m_lo = static_cast<uint32_t>(mult_factor_int);
         constexpr uint32_t m_hi = static_cast<uint32_t>(static_cast<uint64_t>(mult_factor_int) >> 32);
@@ -517,7 +514,7 @@ public:
     // Multiply an input value by the multiplier using integer arithmetic and bit-shifting.
     // Unconditionally always_inline so the integer multiply-and-shift fuses into the caller —
     // the previous force_inlining option flag has been retired in favor of this default.
-    OPT_MATH_BITS_INLINE static constexpr io_type mult(io_type input_val)
+    MATH_BITS_ALWAYS_INLINE static constexpr io_type mult(io_type input_val)
     {
         // Optional clamp — disappears entirely when clamp_input == false. Uses early return with
         // the precomputed max_output_int to avoid the redundant uxth GCC inserts after a
@@ -547,13 +544,13 @@ public:
     }
 
     // Overload the * operator to use the optimized multiplication
-    OPT_MATH_BITS_INLINE constexpr inline io_type operator*(io_type val) const
+    MATH_BITS_ALWAYS_INLINE constexpr inline io_type operator*(io_type val) const
     {
         return mult(val);
     }
 
     // Overload the * operator to use the optimized multiplication
-    OPT_MATH_BITS_INLINE friend constexpr inline io_type operator*(io_type val, const mult_type& rhs)
+    MATH_BITS_ALWAYS_INLINE friend constexpr inline io_type operator*(io_type val, const mult_type& rhs)
     {
     	return rhs.mult(val);
     }
@@ -619,6 +616,5 @@ namespace math_bits_d1_regression
         "D1 regression: mult(max_input_int) must equal max_output_int — clamp boundary must not step down.");
 }
 
-// Drop the helper macros so they don't leak into translation units that include this header.
-#undef OPT_MATH_BITS
-#undef OPT_MATH_BITS_INLINE
+// Drop the helper macro so it doesn't leak into translation units that include this header.
+#undef MATH_BITS_ALWAYS_INLINE
