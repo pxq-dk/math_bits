@@ -85,7 +85,7 @@ uint32_t seconds = ticks_to_s::mult(ticks);      // no cast; range checked at co
 // (one hour -> 3599). Set trade_speed_for_precision for round-to-nearest (-> 3600).
 ```
 
-The compile-time checks verify that `multvalue * max_input_value` fits in `out_type`. Inputs above `max_input_value` are outside the contract: without `clamp_input` their result is truncated to `out_type`.
+The compile-time checks verify that `multvalue * max_input_value` fits in `out_type`. Inputs above `max_input_value` are outside the contract: without `clamp_input` their result is truncated to `out_type`. If the input is not guaranteed to stay within `max_input_value` (e.g. a free-running counter), enable `clamp_input` — such inputs then return `max_output_int` instead of a wrong value.
 
 **Precision limit for large input ranges:** the product `max_input_value × multiplier` must fit in `calc_type`, so a very large input range leaves few bits for the multiplier. The multiplier needs roughly as many bits as the output, so `max_error ≤ 1` needs approximately `max_output × max_input_value < 2^(bits(calc_type)+1)`. In the example above: up to 2^40 ticks the worst-case error is 0.25 LSB, at 2^42 ticks it is ~15 LSB (rejected at compile time with the default `max_error`).
 
@@ -129,6 +129,7 @@ All members are `static constexpr`. Override only the ones you want by deriving 
 | `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the true floating-point result (in LSB). Generalized to `uint64_t` so the struct doesn't depend on the output type; the class casts back to `out_type` internally. Must fit in `out_type`. |
 | `deep_test` | `bool` | `false` | Default `false` runs a quick smoke test of up to 100 samples at compile time — fast to build. Set `true` for the full sweep (up to 65536 samples) when you want maximum assurance and can absorb the compile-time cost. |
 | `clamp_input` | `bool` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
+| `trade_speed_for_precision` | `bool` | `false` | Rounding mode. `false` truncates: `mult()` targets `floor(input · multvalue)`. `true` rounds to nearest: a half-LSB bias is added before the shift, so `mult()` targets `round(input · multvalue)` — exactly, when the shift headroom permits (then `max_error = 0` can pass). Cost: one extra add per call (2–3 instructions in the 64-bit split multiply). Needs 1 LSB extra headroom in `out_type` and room for the bias in `calc_type` (both checked at compile time). **Changes the result, not just its accuracy:** keep `false` where floor semantics matter, e.g. elapsed whole seconds (47999 ticks at 48 kHz must be 0 s, not 1 s) or bucket/index calculations. Not available in the legacy positional form. |
 | `min_output_range` | `uint64_t` | `1` | Minimum required output range: `multvalue * max_input_value` must be at least this many LSBs, otherwise the build fails. Output resolution is 1 LSB of `out_type`, so relative full-scale resolution is ~`1/(multvalue * max_input_value)` — e.g. set `100` to require ≥ 1%. The default `1` only rejects scalers whose every output would be below 1 LSB (which cannot compile anyway). Compile-time only, zero runtime cost. |
 | `out_type` | type | `void` | Return type of `mult()`; `void` means "same as `io_type`". Set it when input and output need different widths (`using out_type = uint32_t;`) — see [Different input and output types](#different-input-and-output-types). Must be an unsigned integer type, and `multvalue * max_input_value` must fit in it (checked at compile time). |
 
@@ -170,6 +171,7 @@ For backwards compatibility, the previous positional signature is preserved as a
 | `max_deviation` | Same as `max_error` — kept for backwards compatibility |
 | `deep_test` | The configured `deep_test` flag from `Options` |
 | `clamp_input` | The configured `clamp_input` flag from `Options` |
+| `trade_speed_for_precision` | The configured rounding mode from `Options` |
 | `min_output_range` | The configured `min_output_range` from `Options` |
 | `out_type` | The type `mult()` returns: `Options::out_type`, or `io_type` when that is `void` |
 | `options` | The `Options` traits-class type itself, exposed for inspection |
@@ -196,6 +198,9 @@ Sampling alone can miss inputs: in large ranges only a fraction of inputs reach 
 In the gray zone only inputs with `x·|e| > max_error` can fail, and only by exactly 1 LSB. Within one output level the input closest to the level boundary has the largest error, so one candidate per level is tested — starting at `max_input_value`, where the error is largest, and walking down. Up to 65536 candidates are tested with `deep_test=true` (1024 otherwise); when all candidates fit in that budget, the check is exhaustive and exact. Otherwise the configuration passes if the tested candidates pass — a remaining miss is bounded to `max_error + 1`.
 
 The broad sweep still runs afterwards as an independent cross-check of the implementation.
+
+**Exact compile-time arithmetic**
+`multvalue` is a binary floating-point number, so it is exactly `mantissa · 2^exponent`. The library decomposes it at compile time and derives `bitShifts` and `mult_factor_int`, and computes the self-test reference `floor(input · multvalue)`, in exact 128-bit integer arithmetic (a small built-in `constexpr` type — `arm-none-eabi` has no `__int128`). This matters because GCC evaluates `constexpr` code with the *target's* types: on ARM, `long double` is a 53-bit `double`, which cannot represent `UINT64_MAX` or 64-bit inputs above 2^53 exactly. No runtime cost; deep self-tests compile somewhat slower. `multvalue` may be `float`, `double` or an 80-bit `long double`; types with more than 64 mantissa bits (128-bit `long double`) are rejected at compile time — use `double`.
 
 **Why waste one extra type parameter for `calc_type`?**
 The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `out_type` at the end.

@@ -114,6 +114,105 @@ struct mult_bitshift_options
     using out_type = void;
 };
 
+namespace math_bits_detail
+{
+    // Minimal unsigned 128-bit integer for exact compile-time arithmetic (parameter derivation and
+    // the self-test reference). Used only in constant evaluation: arm-none-eabi has no __int128,
+    // and its long double is a 53-bit double, which cannot even represent UINT64_MAX.
+    struct u128
+    {
+        uint64_t hi = 0;
+        uint64_t lo = 0;
+
+        constexpr u128() = default;
+        constexpr u128(uint64_t v) : hi(0), lo(v) {}
+        constexpr u128(uint64_t h, uint64_t l) : hi(h), lo(l) {}
+
+        constexpr int bit_width() const
+        {
+            return hi ? 64 + static_cast<int>(std::bit_width(hi)) : static_cast<int>(std::bit_width(lo));
+        }
+
+        friend constexpr bool operator==(const u128& a, const u128& b) { return a.hi == b.hi && a.lo == b.lo; }
+        friend constexpr bool operator<(const u128& a, const u128& b) { return a.hi != b.hi ? a.hi < b.hi : a.lo < b.lo; }
+        friend constexpr bool operator<=(const u128& a, const u128& b) { return !(b < a); }
+
+        friend constexpr u128 operator+(const u128& a, const u128& b)
+        {
+            const uint64_t lo = a.lo + b.lo;
+            return { a.hi + b.hi + (lo < a.lo ? 1u : 0u), lo };
+        }
+        friend constexpr u128 operator-(const u128& a, const u128& b)
+        {
+            return { a.hi - b.hi - (a.lo < b.lo ? 1u : 0u), a.lo - b.lo };
+        }
+        // Shifts by >= 128 give 0 (no UB).
+        friend constexpr u128 operator<<(const u128& a, int n)
+        {
+            if (n <= 0)   return a;
+            if (n >= 128) return {};
+            if (n >= 64)  return { a.lo << (n - 64), 0 };
+            return { (a.hi << n) | (a.lo >> (64 - n)), a.lo << n };
+        }
+        friend constexpr u128 operator>>(const u128& a, int n)
+        {
+            if (n <= 0)   return a;
+            if (n >= 128) return {};
+            if (n >= 64)  return { 0, a.hi >> (n - 64) };
+            return { a.hi >> n, (a.lo >> n) | (a.hi << (64 - n)) };
+        }
+    };
+
+    // Full 64x64 -> 128-bit product from 32-bit halves.
+    constexpr u128 mul64(uint64_t a, uint64_t b)
+    {
+        const uint64_t a_lo = a & 0xFFFFFFFFu, a_hi = a >> 32;
+        const uint64_t b_lo = b & 0xFFFFFFFFu, b_hi = b >> 32;
+        const uint64_t ll = a_lo * b_lo, lh = a_lo * b_hi, hl = a_hi * b_lo, hh = a_hi * b_hi;
+        const uint64_t mid = (ll >> 32) + (lh & 0xFFFFFFFFu) + (hl & 0xFFFFFFFFu); // <= 3*(2^32-1)
+        return { hh + (lh >> 32) + (hl >> 32) + (mid >> 32), (mid << 32) | (ll & 0xFFFFFFFFu) };
+    }
+
+    // Exact binary decomposition of a positive, finite floating-point value: v = mant * 2^exp,
+    // with mant < 2^digits(T). Multiplying or dividing by 2 is exact in binary floating point.
+    struct dyadic
+    {
+        uint64_t mant;
+        int      exp;
+    };
+
+    template<typename T>
+    constexpr dyadic decompose(T v)
+    {
+        constexpr int D = std::numeric_limits<T>::digits; // 24 (float), 53 (double), 64 (x86 long double)
+        static_assert(D <= 64, "multvalue's floating-point type has more than 64 mantissa bits (e.g. 128-bit long double); use double");
+        T top = 1;
+        for (int i = 0; i < D; ++i) top *= 2;              // 2^D, exact
+        int e = 0;
+        while (v >= top)    { v /= 2; ++e; }
+        while (v < top / 2) { v *= 2; --e; }
+        return { static_cast<uint64_t>(v), e };
+    }
+
+    // Sign of (f * k * 2^sh) - n, evaluated exactly: compares multvalue * k * 2^sh with integer n.
+    constexpr int cmp_scaled(const dyadic& f, uint64_t k, int sh, const u128& n)
+    {
+        const u128 p = mul64(f.mant, k);
+        const int t = f.exp + sh;
+        if (t >= 0)
+        {
+            if (p.bit_width() + t > 128) return 1;           // p * 2^t >= 2^128 > n
+            const u128 l = p << t;
+            return n < l ? 1 : (l == n ? 0 : -1);
+        }
+        const int s = -t;                                     // compare p with n * 2^s
+        if (n.bit_width() == 0) return p.bit_width() ? 1 : 0;
+        if (n.bit_width() + s > 128) return -1;               // n * 2^s >= 2^128 > p
+        const u128 r = n << s;
+        return r < p ? 1 : (p == r ? 0 : -1);
+    }
+}
+
 // Template class with unit testing for mult_bitshift. DeepTest=true is the
 // backwards-compat default for external `unit_test_mult_bitshift<some_mult>` callers.
 template<typename MultType, bool DeepTest = true>
@@ -171,14 +270,29 @@ public:
         return arr;
     }
 
-    // Floating-point reference result for `input`: floor(input * mult_factor + bias),
-    // bias = 0.5 when trade_speed_for_precision (round-to-nearest), else 0 (truncation).
+    // Reference result for `input`: floor(input * multvalue + bias), bias = 0.5 when
+    // trade_speed_for_precision (round-to-nearest), else 0 (truncation). reference_bias is only used
+    // for the floating-point starting guess in level_start(); reference() itself is exact.
     static constexpr long double reference_bias = MultType::trade_speed_for_precision ? 0.5L : 0.0L;
 
+    // Computed exactly in 128-bit integers from multvalue = mant * 2^exp (input * mant needs up to
+    // 128 bits), so it stays exact for 64-bit inputs and for targets with a 53-bit long double.
     static constexpr out_type reference(io_type input)
     {
-    	return static_cast<out_type>(
-    		static_cast<long double>(input) * static_cast<long double>(mult_factor) + reference_bias);
+    	using math_bits_detail::u128;
+    	const math_bits_detail::dyadic f = MultType::f_dyadic;
+    	u128 p = math_bits_detail::mul64(static_cast<uint64_t>(input), f.mant);
+    	if (f.exp >= 0)
+    	{
+    		p = p << f.exp;                       // integer result; the +0.5 bias cannot change floor()
+    	}
+    	else
+    	{
+    		const int k = -f.exp;                 // floor(p / 2^k + bias)
+    		if constexpr (MultType::trade_speed_for_precision) p = p + (u128(1) << (k - 1));
+    		p = p >> k;
+    	}
+    	return static_cast<out_type>(p.lo);
     }
 
     static constexpr bool number_ok(io_type input)
@@ -363,8 +477,20 @@ public:
     static_assert(Options::max_error <= static_cast<uint64_t>(std::numeric_limits<out_type>::max()),
                   "Options::max_error does not fit in out_type!");
 
-    // Calculate the maximum multiplication factor that fits into calc_type
-    static constexpr calc_type calc_max_mult()
+    // multvalue = f_dyadic.mant * 2^f_dyadic.exp, exactly. The parameter derivation below works on
+    // this in exact integer arithmetic (math_bits_detail), so no long double rounding is involved.
+    static constexpr math_bits_detail::dyadic f_dyadic = math_bits_detail::decompose(multvalue);
+
+    // Sign of (multvalue * max_input_value * 2^sh) - n, evaluated exactly.
+    static constexpr int cmp_product(int sh, math_bits_detail::u128 n)
+    {
+        return math_bits_detail::cmp_scaled(f_dyadic, static_cast<uint64_t>(max_input_value), sh, n);
+    }
+
+    // Validate the parameters, then return the shift: the largest s < digits(calc_type) with
+    // multvalue * max_input_value * 2^s <= max(calc_type), so the multiplier gets every bit of
+    // calc_type that the input range leaves free.
+    static constexpr uint8_t calc_bitshifts()
     {
         // Validate template parameters at compile-time
         static_assert(std::is_floating_point_v<float_type>, "multvalue must be float, double, or long double");
@@ -384,63 +510,50 @@ public:
         // Ensure the result of mult(max_input_value) fits in out_type, with headroom for max_error
         // (and an extra LSB when trade_speed_for_precision is on, since round-half-up can bump
         //  the float ideal up by half an LSB at the out_type scale before the cast).
-        static_assert(static_cast<long double>(multvalue) * static_cast<long double>(max_input_value)
-                      <= static_cast<long double>(std::numeric_limits<out_type>::max() - max_error)
-                         - (trade_speed_for_precision ? 1.0L : 0.0L),
+        static_assert(static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - max_error
+                          >= (trade_speed_for_precision ? 1u : 0u)
+                      && cmp_product(0, static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - max_error
+                                         - (trade_speed_for_precision ? 1u : 0u)) <= 0,
                       "multvalue * max_input_value would overflow out_type (no headroom for max_error or rounding bias)!");
 
         // Reject scalers: if the product is < 1, every valid input maps to an output
         // below 1 LSB (always 0 when truncating; at most 0/1 with trade_speed_for_precision).
-        // Checked before the division below, which cannot handle a product < 1 and would
-        // otherwise fail with an internal "Division result too big" error.
-        static_assert(static_cast<long double>(multvalue) * static_cast<long double>(max_input_value) >= 1.0L,
+        static_assert(cmp_product(0, 1) >= 0,
                       "multvalue * max_input_value < 1: every ideal output would be below 1 LSB. "
                       "Scale the result up (e.g. output in milli-units) or raise max_input_value.");
 
         // Opt-in resolution requirement (Options::min_output_range). The hard limit above
         // stays separate so a min_output_range of 0 cannot bypass it; values <= 1 are already
         // covered by it, so they are skipped here to avoid a duplicate diagnostic.
-        static_assert(min_output_range <= 1
-                      || static_cast<long double>(multvalue) * static_cast<long double>(max_input_value)
-                         >= static_cast<long double>(min_output_range),
+        static_assert(min_output_range <= 1 || cmp_product(0, min_output_range) >= 0,
                       "multvalue * max_input_value < Options::min_output_range: output too coarse. "
                       "Scale the result up (e.g. output in milli-units) or lower min_output_range.");
 
-        // Calculate the maximum multiplication factor that won't overflow calc_type
-        constexpr long double maxVal = static_cast<long double>(std::numeric_limits<calc_type>::max());
-        constexpr long double res = maxVal / (static_cast<long double>(multvalue) * static_cast<long double>(max_input_value));
-        static_assert(res <= static_cast<long double>(std::numeric_limits<calc_type>::max()), "Division result too big");
+        constexpr uint64_t calc_max = static_cast<uint64_t>(std::numeric_limits<calc_type>::max());
+        static_assert(cmp_product(0, calc_max) <= 0,
+                      "multvalue * max_input_value exceeds the range of calc_type — choose a wider calc_type!");
 
-        return static_cast<calc_type>(res);
+        int s = std::numeric_limits<calc_type>::digits - 1;
+        while (s > 0 && cmp_product(s, calc_max) > 0) --s;
+        return static_cast<uint8_t>(s);
     }
 
-    // Compute the number of bits needed to represent max_mult_fact
-    static constexpr uint8_t calc_bitshifts()
-    {
-        // C++20 does not have std::log2 constexpr support, so we use bit_width
-        static_assert(max_mult_fact > 0, "max_mult_fact is probably zero, and this is not allowed!");
-        return static_cast<uint8_t>(std::bit_width(max_mult_fact) - 1);
-    }
-
-    // Calculate the integer multiplier used in bit-shift multiplication
+    // Integer multiplier: round-half-up(multvalue * 2^bitShifts), computed exactly. It fits
+    // calc_type, since multvalue * 2^bitShifts <= max(calc_type) / max_input_value.
     static constexpr calc_type calc_mult_fact_int()
     {
-        // Scale factor is 2^bitShifts (matches the runtime >> bitShifts divide)
-        calc_type maxVal = static_cast<calc_type>(1) << bitShifts;
-
-        // Multiply floating-point factor by scaled max value
-        long double mult_val_tmp = static_cast<long double>(mult_factor) * static_cast<long double>(maxVal);
-
-        // Round to nearest integer without using std::round() (for constexpr)
-        calc_type mult_val = static_cast<calc_type>(mult_val_tmp + 0.5);
-        return mult_val;
+        using math_bits_detail::u128;
+        const int t = f_dyadic.exp + bitShifts;
+        u128 m = f_dyadic.mant;
+        if (t >= 0) m = m << t;
+        else        m = (m + (u128(1) << (-t - 1))) >> -t;
+        return static_cast<calc_type>(m.lo);
     }
 
     // Template constants for internal calculations
     static constexpr out_type max_deviation{max_error};
     static constexpr float_type mult_factor{multvalue};        // Floating-point multiplier
     static constexpr io_type max_input_int{max_input_value};   // Maximum allowed input
-    static constexpr calc_type max_mult_fact{calc_max_mult()}; // Maximum multiplication factor
     static constexpr uint8_t bitShifts{calc_bitshifts()};     // Number of bits to shift
 
     // Defense-in-depth: shift count must be < calc_type width for well-defined shift behavior
@@ -458,9 +571,9 @@ public:
 
     // Defense-in-depth: max_input_value * mult_factor_int (+ round_bias when the rounding
     // path is active) must not overflow calc_type at runtime
-    static_assert(static_cast<long double>(max_input_int) * static_cast<long double>(mult_factor_int)
-                  + (trade_speed_for_precision ? static_cast<long double>(round_bias) : 0.0L)
-                  <= static_cast<long double>(std::numeric_limits<calc_type>::max()),
+    static_assert(math_bits_detail::mul64(static_cast<uint64_t>(max_input_int), static_cast<uint64_t>(mult_factor_int))
+                  + math_bits_detail::u128(trade_speed_for_precision ? static_cast<uint64_t>(round_bias) : uint64_t{0})
+                  <= math_bits_detail::u128(static_cast<uint64_t>(std::numeric_limits<calc_type>::max())),
                   "max_input_value * mult_factor_int (+ rounding bias if trade_speed_for_precision) would overflow calc_type — choose a wider calc_type or smaller max_input_value!");
 
     // Precomputed maximum output: mult(max_input_int). Used by the clamp_input early-return path,
@@ -531,9 +644,9 @@ public:
             hi += b_hi + (lo < b_lo ? 1u : 0u); // + carry out of the low word
         }
 
-        // The output fits out_type (<= 32 bits), so multvalue * max_input_value < 2^32 and
-        // max_mult_fact = 2^64 / (multvalue * max_input_value) > 2^32: the shift always drops the
-        // whole low word, and only hi is needed.
+        // The output fits out_type (<= 32 bits), so multvalue * max_input_value < 2^32, and the
+        // largest shift with multvalue * max_input_value * 2^bitShifts <= 2^64 - 1 is >= 32: the
+        // shift always drops the whole low word, and only hi is needed.
         static_assert(bitShifts >= 32, "split multiply assumes bitShifts >= 32 (guaranteed for out_type <= 32 bits)");
         return static_cast<out_type>(hi >> (bitShifts - 32));
     }
