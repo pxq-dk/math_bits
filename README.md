@@ -9,7 +9,7 @@ Header-only C++20 library for multiplying integers by a constant floating-point 
 - **No floating-point at runtime** — all FPU operations happen at compile time. The generated code is pure integer arithmetic.
 - **Compile-time parameter generation** — multiplier, bit-shift count, and integer scale factor are all derived at compile time from the floating-point input.
 - **Overflow safe** — the maximum multiplication factor is computed at compile time to guarantee no overflow for the given input range.
-- **Configurable accuracy** — `max_error` (in the options traits class) sets the allowed deviation from the true floating-point result. Defaults to ±1 LSB.
+- **Configurable accuracy** — `max_error` (in the options traits class) sets the allowed deviation from the floating-point expression the scaler replaces. Defaults to ±1 LSB.
 - **Compile-time unit tests** — a `static_assert` runs a full test suite at compile time. A broken instantiation will not compile.
 - **Header-only** — single `.h` file, no dependencies beyond the C++ standard library.
 - **Always-inlined hot path** — `mult()` is unconditionally `[[gnu::always_inline]]`, so the integer multiply-and-shift fuses into the caller with no extra flag.
@@ -38,6 +38,8 @@ uint16_t result = scale75::mult(800);  // result ≈ 600
 ```
 
 `multvalue` must be a floating-point constant (`0.75`, `1.0 / 1000`); it is only used at compile time, and the generated code is pure integer arithmetic. For integer gains, write `x * k` directly — GCC already produces optimal code. This library is for division and fractional factors, where it replaces a slow software division (on Cortex-M0/M0+) with an inline multiply and shift.
+
+**What `mult()` guarantees:** the same result as the floating-point expression it replaces — `(out_type)((T)x * multvalue)`, or `(out_type)((T)x * multvalue + 0.5)` with `trade_speed_for_precision` — evaluated in IEEE arithmetic of `multvalue`'s type `T` (as soft-float `double` on a Cortex-M0+ does), within `max_error` (default 1 LSB). Note that this is the *floating-point* result, quirks included: `0.7` is stored as `0.69999999999999995559…`, so in `double` code `10 * 0.7` gives `7` but `90 * 0.7` gives `62`. No fixed multiplier reproduces such a pattern exactly, so `max_error = 0` is not achievable for every constant; the compile-time check tells you.
 
 ### Operator overload
 
@@ -83,8 +85,9 @@ struct u32_out : mult_bitshift_options {
 using ticks_to_s = mult_bitshift<1.0 / 48000, 1099511627775ull, uint64_t, uint64_t, u32_out>;
 
 uint32_t seconds = ticks_to_s::mult(ticks);      // no cast; range checked at compile time
-// Within max_error (1 LSB) of ticks / 48000 — truncation can land 1 below an exact value
-// (one hour -> 3599). Set trade_speed_for_precision for round-to-nearest (-> 3600).
+// Within max_error (1 LSB) of the double expression ticks * (1.0 / 48000): over this wide range
+// truncation can land 1 below it (one hour -> 3599, double code gives 3600). Set
+// trade_speed_for_precision for round-to-nearest (-> 3600).
 ```
 
 The compile-time checks verify that `multvalue * max_input_value` fits in `out_type`. Inputs above `max_input_value` are outside the contract: without `clamp_input` their result is truncated to `out_type`. If the input is not guaranteed to stay within `max_input_value` (e.g. a free-running counter), enable `clamp_input` — such inputs then return `max_output_int` instead of a wrong value.
@@ -128,10 +131,10 @@ All members are `static constexpr`. Override only the ones you want by deriving 
 
 | Member | Type | Default | Description |
 |---|---|---|---|
-| `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the true floating-point result (in LSB). Generalized to `uint64_t` so the struct doesn't depend on the output type; the class casts back to `out_type` internally. Must fit in `out_type`. |
+| `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the floating-point expression (in LSB; see *What `mult()` guarantees*). Generalized to `uint64_t` so the struct doesn't depend on the output type; the class casts back to `out_type` internally. Must fit in `out_type`. |
 | `deep_test` | `bool` | `false` | Default `false` runs a quick smoke test of up to 100 samples at compile time — fast to build. Set `true` for the full sweep (up to 65536 samples) when you want maximum assurance and can absorb the compile-time cost. |
 | `clamp_input` | `bool` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
-| `trade_speed_for_precision` | `bool` | `false` | Rounding mode. `false` truncates: `mult()` targets `floor(input · multvalue)`. `true` rounds to nearest: a half-LSB bias is added before the shift, so `mult()` targets `round(input · multvalue)` — exactly, when the shift headroom permits (then `max_error = 0` can pass). Cost: one extra add per call (2–3 instructions in the 64-bit split multiply) — skipped automatically when it provably changes no result, i.e. when `max_input_value × (mult_factor_int mod 2^bitShifts) < 2^(bitShifts−1)` (integer and near-integer factors); results are identical either way. Needs 1 LSB extra headroom in `out_type` and room for the bias in `calc_type` (both checked at compile time). **Changes the result, not just its accuracy:** keep `false` where floor semantics matter, e.g. elapsed whole seconds (47999 ticks at 48 kHz must be 0 s, not 1 s) or bucket/index calculations. Not available in the legacy positional form. |
+| `trade_speed_for_precision` | `bool` | `false` | Rounding mode. `false` truncates: `mult()` targets `(out_type)(x * multvalue)`. `true` rounds half up: a half-LSB bias is added before the shift, so `mult()` targets `(out_type)(x * multvalue + 0.5)` (both in floating-point, see *What `mult()` guarantees*). Cost: one extra add per call (2–3 instructions in the 64-bit split multiply) — skipped automatically when it provably changes no result, i.e. when `max_input_value × (mult_factor_int mod 2^bitShifts) < 2^(bitShifts−1)` (integer and near-integer factors); results are identical either way. Needs 1 LSB extra headroom in `out_type` and room for the bias in `calc_type` (both checked at compile time). **Changes the result, not just its accuracy:** keep `false` where floor semantics matter, e.g. elapsed whole seconds (47999 ticks at 48 kHz must be 0 s, not 1 s) or bucket/index calculations. Not available in the legacy positional form. |
 | `min_output_range` | `uint64_t` | `1` | Minimum required output range: `multvalue * max_input_value` must be at least this many LSBs, otherwise the build fails. Output resolution is 1 LSB of `out_type`, so relative full-scale resolution is ~`1/(multvalue * max_input_value)` — e.g. set `100` to require ≥ 1%. The default `1` only rejects scalers whose every output would be below 1 LSB (which cannot compile anyway). Compile-time only, zero runtime cost. |
 | `out_type` | type | `void` | Return type of `mult()`; `void` means "same as `io_type`". Set it when input and output need different widths (`using out_type = uint32_t;`) — see [Different input and output types](#different-input-and-output-types). Must be an unsigned integer type, and `multvalue * max_input_value` must fit in it (checked at compile time). |
 
@@ -167,7 +170,8 @@ For backwards compatibility, the previous positional signature is preserved as a
 | `mult_factor` | The original floating-point multiplier |
 | `max_input_int` | The configured maximum input value |
 | `bitShifts` | Number of bits shifted in the integer multiplication |
-| `mult_factor_int` | The integer scale factor derived from `mult_factor` |
+| `mult_factor_int` | The integer multiplier `mult()` uses (see *Multiplier selection*) |
+| `mult_factor_int_nearest` | The default multiplier, `mult_factor · 2^bitShifts` rounded to nearest — differs from `mult_factor_int` when the selection chose the other rounding direction |
 | `max_output_int` | Precomputed `mult(max_input_int)` — the largest value `mult()` will ever return |
 | `max_error` | The configured `max_error` from `Options`, cast to `out_type` |
 | `max_deviation` | Same as `max_error` — kept for backwards compatibility |
@@ -186,23 +190,26 @@ For backwards compatibility, the previous positional signature is preserved as a
 On Cortex-M0/M0+ there is no FPU. A floating-point multiply compiles to a software library call — slow, non-deterministic, and unsuitable for ISRs. By computing the scale factor at compile time and using a single integer multiply + shift at runtime, the hot path becomes 2–3 instructions with deterministic latency.
 
 **Why compile-time unit tests?**
-The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the true floating-point result. If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. By default (`deep_test=false`) the sweep runs up to 100 samples — fast to compile and adequate for catching gross errors. Set `deep_test=true` for the full sweep (up to 65536 samples) when you want maximum assurance. The sample count is capped by the input range: when `max_input_value + 1` is at or below the cap, every input from 0 to `max_input_value` is tested exactly once (exhaustive). `max_input_value` itself is always tested.
+The test suite verifies that every value in a representative sample of the input range produces a result within `max_error` of the floating-point expression (see *What `mult()` guarantees*). If the chosen `max_error` is too tight for the given multiplier and types, the build fails with a clear message — no separate test binary required. By default (`deep_test=false`) the sweep runs up to 100 samples — fast to compile and adequate for catching gross errors. Set `deep_test=true` for the full sweep (up to 65536 samples) when you want maximum assurance. The sample count is capped by the input range: when `max_input_value + 1` is at or below the cap, every input from 0 to `max_input_value` is tested exactly once (exhaustive). `max_input_value` itself is always tested.
 
 **Error analysis and targeted gray-zone check**
-Sampling alone can miss inputs: in large ranges only a fraction of inputs reach the worst-case error. So before the sweep, the error is analysed. `mult(x)` and the reference differ internally by `x·e`, where `e = mult_factor_int / 2^bitShifts − multvalue` is the quantization error of the integer factor. The output error at `x` is therefore `floor(x·|e|)` or `ceil(x·|e|)`, and with `Δ = max_input_value·|e|`:
+Sampling alone can miss inputs: in large ranges only a fraction of inputs reach the worst-case error. So before the sweep, the error is analysed. `mult(x)` and the reference differ internally by `x·e − ρ(x)`, where `e = mult_factor_int / 2^bitShifts − multvalue` is the quantization error of the integer factor and `ρ(x)` is the IEEE rounding inside the floating-point reference (zero when every product is exactly representable, otherwise below a small power of two). With `Δ = max_input_value·|e| + ρ_bound`:
 
 | Case | Condition | Result |
 |---|---|---|
-| Proven OK | `ceil(Δ) ≤ max_error` | Passes — no input can exceed `max_error` |
-| Proven FAIL | `floor(Δ) > max_error` | Fails — `max_input_value` is a counterexample |
+| Proven OK | `Δ ≤ max_error` | Passes — no input can exceed `max_error` |
+| Proven FAIL | `mult(max_input_value)` is off by more than `max_error` | Fails — `max_input_value` is a counterexample |
 | Gray zone | otherwise | Targeted check (below) |
 
-In the gray zone only inputs with `x·|e| > max_error` can fail, and only by exactly 1 LSB. Within one output level the input closest to the level boundary has the largest error, so one candidate per level is tested — starting at `max_input_value`, where the error is largest, and walking down. Up to 65536 candidates are tested with `deep_test=true` (1024 otherwise); when all candidates fit in that budget, the check is exhaustive and exact. Otherwise the configuration passes if the tested candidates pass — a remaining miss is bounded to `max_error + 1`.
+In the gray zone only inputs with `x·|e| + ρ_bound > max_error` can fail. Within one output level (all inputs with the same reference result) the reference is constant and `mult()` only grows, so the worst overshoot is at the level's last input and the worst undershoot at its first. The check tests those ends (one end when the reference is exact, both otherwise) level by level, starting at `max_input_value`, where the multiplier's error is largest, and walking down. Up to 65536 candidates are tested with `deep_test=true` (1024 otherwise); when all candidates fit in that budget, the check is exhaustive and exact. Otherwise the configuration passes if the tested candidates pass — a remaining miss is bounded to `max_error + 1`. (Known limit: with `max_error = 0` and a very large output range — hundreds of millions of levels — scattered near-integer cases deep in the range can be missed.)
 
 The broad sweep still runs afterwards as an independent cross-check of the implementation.
 
 **Exact compile-time arithmetic**
-`multvalue` is a binary floating-point number, so it is exactly `mantissa · 2^exponent`. The library decomposes it at compile time and derives `bitShifts` and `mult_factor_int`, runs the error analysis (proven OK, gray-zone threshold), and computes the self-test reference `floor(input · multvalue)`, all in exact 128-bit integer arithmetic (a small built-in `constexpr` type — `arm-none-eabi` has no `__int128`). This matters because GCC evaluates `constexpr` code with the *target's* types: on ARM, `long double` is a 53-bit `double`, which cannot represent `UINT64_MAX` or 64-bit inputs above 2^53 exactly. No runtime cost; deep self-tests compile somewhat slower. `multvalue` may be `float`, `double` or an 80-bit `long double`; types with more than 64 mantissa bits (128-bit `long double`) are rejected at compile time — use `double`.
+`multvalue` is a binary floating-point number, so it is exactly `mantissa · 2^exponent`. The library decomposes it at compile time and derives `bitShifts` and `mult_factor_int`, runs the error analysis (proven OK, gray-zone threshold), and computes the self-test reference — the IEEE floating-point expression, emulated bit-exactly (round to nearest, ties to even, for the conversion of `x`, the product and the `+ 0.5`) — all in exact 128-bit integer arithmetic (a small built-in `constexpr` type — `arm-none-eabi` has no `__int128`). The emulation does not depend on the host's or the target's floating-point unit; it was verified against real `float`, `double` and x87 `long double` hardware arithmetic. This matters because GCC evaluates `constexpr` code with the *target's* types: on ARM, `long double` is a 53-bit `double`, which cannot represent `UINT64_MAX` or 64-bit inputs above 2^53 exactly. No runtime cost; deep self-tests compile somewhat slower. `multvalue` may be `float`, `double` or an 80-bit `long double`; types with more than 64 mantissa bits (128-bit `long double`) are rejected at compile time — use `double`.
+
+**Multiplier selection**
+`multvalue · 2^bitShifts` is generally not an integer, so the multiplier must be rounded; by default to nearest (`mult_factor_int_nearest`). The other direction — or, when the value is exactly an integer, one step above it — is sometimes more accurate: for division-like constants such as `1.0 / 1000`, `1.0 / 3` or ADC scaling `3300.0 / 4095` it can make every result equal to the floating-point expression where the nearest multiplier is 1 LSB off. Only the constant differs, so there is no runtime cost. The alternative is chosen only when it is verifiably better against the same reference and its proven worst case is not worse; on a tie the nearest multiplier is kept. The full self-test then runs on the chosen multiplier.
 
 **Why waste one extra type parameter for `calc_type`?**
 The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `out_type` at the end.
