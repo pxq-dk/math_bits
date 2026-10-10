@@ -184,6 +184,9 @@ namespace math_bits_detail
     template<typename T>
     constexpr dyadic decompose(T v)
     {
+        // Non-floating multvalue is rejected by mult_bitshift's own static_assert; return a
+        // harmless value here so that clear message is not buried under follow-on errors.
+        if constexpr (!std::is_floating_point_v<T>) return { 1, 0 };
         constexpr int D = std::numeric_limits<T>::digits; // 24 (float), 53 (double), 64 (x86 long double)
         static_assert(D <= 64, "multvalue's floating-point type has more than 64 mantissa bits (e.g. 128-bit long double); use double");
         T top = 1;

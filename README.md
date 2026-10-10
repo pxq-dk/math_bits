@@ -37,6 +37,8 @@ using scale75 = mult_bitshift<0.75, (uint16_t)1000, uint16_t, uint32_t>;
 uint16_t result = scale75::mult(800);  // result ≈ 600
 ```
 
+`multvalue` must be a floating-point constant (`0.75`, `1.0 / 1000`); it is only used at compile time, and the generated code is pure integer arithmetic. For integer gains, write `x * k` directly — GCC already produces optimal code. This library is for division and fractional factors, where it replaces a slow software division (on Cortex-M0/M0+) with an inline multiply and shift.
+
 ### Operator overload
 
 ```cpp
