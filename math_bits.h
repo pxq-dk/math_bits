@@ -211,6 +211,30 @@ namespace math_bits_detail
         const u128 r = n << s;
         return r < p ? 1 : (p == r ? 0 : -1);
     }
+
+    // Sign of (a * b) - (c * 2^d), exact for any a < 2^128, b < 2^64, c < 2^128, d >= 0:
+    // a * b is formed as a 192-bit value, shifted right by d and compared with c (with the
+    // shifted-out bits deciding a tie), so nothing can overflow.
+    constexpr int cmp_mul_pow2(const u128& a, uint64_t b, const u128& c, int d)
+    {
+        const u128 lo = mul64(a.lo, b), hi = mul64(a.hi, b);
+        const uint64_t w1 = lo.hi + hi.lo;
+        const uint64_t w[3] = { lo.lo, w1, hi.hi + (w1 < lo.hi ? 1u : 0u) };   // a*b = w2:w1:w0
+
+        if (d >= 192) return (w[0] | w[1] | w[2]) ? (c.bit_width() ? -1 : 1) : (c.bit_width() ? -1 : 0);
+        const int ws = d / 64, bs = d % 64;
+        uint64_t q[3] = { 0, 0, 0 };                                              // q = (a*b) >> d
+        for (int i = 0; i + ws < 3; ++i)
+            q[i] = (w[i + ws] >> bs) | ((bs && i + ws + 1 < 3) ? (w[i + ws + 1] << (64 - bs)) : 0u);
+        bool rem = bs && (w[ws] & ((uint64_t{1} << bs) - 1));                     // shifted-out bits
+        for (int j = 0; j < ws; ++j) rem = rem || w[j];
+
+        if (q[2]) return 1;                                                       // q >= 2^128 > c
+        const u128 qq{ q[1], q[0] };
+        if (c < qq) return 1;
+        if (qq < c) return -1;
+        return rem ? 1 : 0;
+    }
 }
 
 // Template class with unit testing for mult_bitshift. DeepTest=true is the
@@ -353,6 +377,8 @@ public:
     static constexpr bool analysis_applies =
     	!(MultType::trade_speed_for_precision && MultType::bitShifts == 0);
 
+    // Informational only (approximate, long double): handy for inspecting a configuration.
+    // The decisions below use the exact values (exact_quant_error).
     static constexpr long double quant_error =
     	static_cast<long double>(MultType::mult_factor_int)
     		/ static_cast<long double>(static_cast<uint64_t>(1) << MultType::bitShifts)
@@ -361,10 +387,56 @@ public:
     static constexpr long double worst_deviation =
     	static_cast<long double>(MultType::max_input_int) * abs_quant_error;
 
-    // Small relative margin so values within float rounding of an integer go to the gray zone,
-    // where they are decided by actual evaluation instead of by the analysis alone.
+    // Exact quantization error, from multvalue = m * 2^E and M = mult_factor_int at shift s:
+    //   e = M/2^s - f = +-(num / 2^den_exp),  num = |M * 2^(-E-s) - m|,  den_exp = -E.
+    // e is exactly 0 when E + s >= 0 (M is then m * 2^(E+s)).
+    struct exact_quant_error
+    {
+    	math_bits_detail::u128 num;   // 0 when the multiplier is exact
+    	int  den_exp;
+    	bool positive;                // e > 0: mult() runs high
+    };
+
+    static constexpr exact_quant_error calc_exact_quant_error()
+    {
+    	using math_bits_detail::u128;
+    	const math_bits_detail::dyadic f = MultType::f_dyadic;
+    	const int k = -(f.exp + MultType::bitShifts);
+    	if (k <= 0) return { u128(0), 0, false };
+    	const u128 M = static_cast<uint64_t>(MultType::mult_factor_int);
+    	// M * 2^k is within 2^(k-1) of m < 2^64 and k <= 127, so it fits; guard anyway: an
+    	// unrepresentable error is treated as huge (nothing proven, everything checked).
+    	if (M.bit_width() + k > 128) return { u128(~uint64_t{0}, ~uint64_t{0}), -f.exp, true };
+    	const u128 a = M << k;
+    	const u128 m = f.mant;
+    	return (m < a) ? exact_quant_error{ a - m, -f.exp, true } : exact_quant_error{ m - a, -f.exp, false };
+    }
+
+    static constexpr exact_quant_error exact_error = calc_exact_quant_error();
+
+    // Sign of (x * |e|) - k, exact.
+    static constexpr int cmp_deviation(uint64_t x, uint64_t k)
+    {
+    	return math_bits_detail::cmp_mul_pow2(exact_error.num, x, math_bits_detail::u128(k), exact_error.den_exp);
+    }
+
+    // Proven OK: max_input * |e| <= max_error, i.e. ceil(worst deviation) <= max_error.
     static constexpr bool proven_ok = analysis_applies
-    	&& worst_deviation * (1.0L + 1e-9L) <= static_cast<long double>(max_deviation);
+    	&& cmp_deviation(static_cast<uint64_t>(MultType::max_input_int), static_cast<uint64_t>(max_deviation)) <= 0;
+
+    // Largest input x <= max_input with x * |e| <= max_error: inputs up to here cannot exceed
+    // max_error. Binary search with exact comparisons (at most 64 steps).
+    static constexpr uint64_t calc_x_safe()
+    {
+    	uint64_t lo = 0, hi = static_cast<uint64_t>(MultType::max_input_int);
+    	while (lo < hi)
+    	{
+    		const uint64_t mid = lo + (hi - lo) / 2 + 1;
+    		if (cmp_deviation(mid, static_cast<uint64_t>(max_deviation)) <= 0) lo = mid;
+    		else                                                               hi = mid - 1;
+    	}
+    	return lo;
+    }
 
     // Gray-zone candidate budget: up to 65536 with deep_test, else the 1024 candidates with the
     // largest expected error (closest to max_input, where the violation window is widest).
@@ -399,13 +471,11 @@ public:
     	else
     	{
     		constexpr uint64_t x_max = MultType::max_input_int;
-    		// Inputs with x*|e| <= max_error cannot violate; margin keeps float rounding safe.
-    		constexpr long double x_crit = static_cast<long double>(max_deviation) / abs_quant_error;
-    		constexpr uint64_t x_lo = (x_crit * (1.0L - 1e-9L) >= static_cast<long double>(x_max))
-    			? x_max : static_cast<uint64_t>(x_crit * (1.0L - 1e-9L));
+    		// Inputs with x*|e| <= max_error cannot violate (exact threshold).
+    		constexpr uint64_t x_lo = calc_x_safe();
 
     		uint64_t checked = 0;
-    		if constexpr (quant_error > 0)
+    		if constexpr (exact_error.positive)
     		{
     			// Largest x of each level, walking down from max_input.
     			uint64_t x = x_max;
