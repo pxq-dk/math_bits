@@ -961,6 +961,12 @@ public:
         return static_cast<out_type>(hi >> (bitShifts - 32));
     }
 
+    // Type of the multiply in mult_core: calc_type, widened to at least unsigned int. A narrower
+    // calc_type (uint8_t, uint16_t) would be promoted to signed int, where an input above
+    // max_input_value could overflow (undefined behaviour). Unsigned arithmetic wraps, and the
+    // product is cast back to calc_type, so the result is the same as a calc_type-wide multiply.
+    using calc_mul_type = std::common_type_t<calc_type, unsigned int>;
+
     // The multiply itself for multiplier M (no clamp): (x * M [+ round_bias]) >> bitShifts.
     // A template so the self-test can evaluate candidate multipliers with exactly this code.
     template<calc_type M>
@@ -973,7 +979,7 @@ public:
         else
         {
             // Scale the input using integer multiplier
-            calc_type output_val = static_cast<calc_type>(input_val) * M;
+            calc_type output_val = static_cast<calc_type>(static_cast<calc_mul_type>(input_val) * M);
             if constexpr (bias_needed_for(M))
             {
                 // Half-LSB bias so the shift below produces round-half-up output —
