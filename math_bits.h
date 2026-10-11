@@ -71,6 +71,23 @@
     #endif
 #endif
 
+// Rounding by shift for a large bias, on cores that cannot add a large constant directly.
+// With trade_speed_for_precision, mult() adds the bias 2^(bitShifts-1) before the shift; from this
+// value on, building that constant costs more than rounding by shifting (identical results):
+//   ARMv6-M (Cortex-M0/M0+):         256    (adds takes 0..255; larger needs movs + lsls)
+//   ARMv8-M Baseline (Cortex-M23):   65536  (movw loads 16-bit constants in one instruction)
+//   other cores:                     0 = off (add takes any power of two as an immediate)
+// Predefine to override the detection (0 disables).
+#ifndef MATH_BITS_SHIFT_ROUND_MIN_BIAS
+    #if defined(__ARM_ARCH_6M__)
+        #define MATH_BITS_SHIFT_ROUND_MIN_BIAS 256
+    #elif defined(__ARM_ARCH_8M_BASE__)
+        #define MATH_BITS_SHIFT_ROUND_MIN_BIAS 65536
+    #else
+        #define MATH_BITS_SHIFT_ROUND_MIN_BIAS 0
+    #endif
+#endif
+
 // Default options for mult_bitshift, passed as a traits-class type template parameter.
 // Derive from this and override only the members you want to change:
 //
@@ -96,7 +113,8 @@
 //   (out_type)round(input * mult_factor) — exactly, when bitShifts headroom permits.
 //   Cost: one extra add per mult() call (typically 1 cycle on Cortex-M0+); when calc_type
 //   has no room for the bias, the same rounding is done with one extra shift and add
-//   instead (no room needed). With sufficient headroom, max_error = 0 will compile-pass;
+//   instead (no room needed); on Cortex-M0/M0+/M23 also when that is shorter
+//   (MATH_BITS_SHIFT_ROUND_MIN_BIAS). With sufficient headroom, max_error = 0 will compile-pass;
 //   otherwise the static
 //   sweep tells you to widen calc_type or reduce max_input_value.
 //
@@ -899,9 +917,10 @@ public:
 
     // Whether max_input * M + round_bias fits calc_type, i.e. the bias can be added before the
     // shift. When it does not (the product fills calc_type's top bits), mult() rounds with
-    //   ((x * M) >> (bitShifts-1)) + 1) >> 1  ==  (x * M + 2^(bitShifts-1)) >> bitShifts
+    //   (((x * M) >> (bitShifts-1)) + 1) >> 1  ==  (x * M + 2^(bitShifts-1)) >> bitShifts
     // instead: with x * M = q * 2^(bitShifts-1) + r, r < 2^(bitShifts-1), both are floor((q+1)/2).
     // Same results, no room needed (one extra shift); the bit width is kept, so no precision is lost.
+    // On Cortex-M0/M0+/M23 it is also used when the bias is large (see round_by_shift_for).
     static constexpr bool bias_fits_for(calc_type M)
     {
         return math_bits_detail::mul64(static_cast<uint64_t>(max_input_int), static_cast<uint64_t>(M))
@@ -916,6 +935,21 @@ public:
         && std::numeric_limits<calc_type>::digits == 64
         && std::numeric_limits<out_type>::digits <= 32
         && std::numeric_limits<io_type>::digits <= 64;
+
+    // Whether mult() with multiplier M rounds by shifting (see bias_fits_for) instead of adding
+    // the bias: always when the bias does not fit, and also when the constant actually added is at
+    // least MATH_BITS_SHIFT_ROUND_MIN_BIAS (shorter code there). In the split multiply that constant
+    // is 2^31 in the low word for bitShifts == 32, else 2^(bitShifts-33) in the high word.
+    static constexpr bool round_by_shift_for(calc_type M)
+    {
+        constexpr uint64_t min_bias = MATH_BITS_SHIFT_ROUND_MIN_BIAS;
+        if (!bias_needed_for(M)) return false;
+        if (!bias_fits_for(M))   return true;
+        if (min_bias == 0)       return false;
+        if (use_split_mul64)
+            return (bitShifts == 32 ? (uint64_t{1} << 31) : (uint64_t{1} << (bitShifts - 33))) >= min_bias;
+        return static_cast<uint64_t>(round_bias) >= min_bias;
+    }
 
     // (x * M [+ round_bias]) >> bitShifts for a 64-bit calc_type, using 32-bit
     // operations only. With M = M_hi*2^32 + M_lo and x = x_hi*2^32 + x_lo:
@@ -960,9 +994,9 @@ public:
             hi += x_hi * m_lo; // low 32 bits of x_hi*M_lo, shifted up by 32 (mod 2^64)
         }
 
-        if constexpr (bias_needed_for(M) && !bias_fits_for(M))
+        if constexpr (round_by_shift_for(M))
         {
-            // Rounding without the bias add (see bias_fits_for): (A >> s) + bit (s-1) of A.
+            // Rounding without the bias add (see round_by_shift_for): (A >> s) + bit (s-1) of A.
             if constexpr (bitShifts == 32)      return static_cast<out_type>(hi + (lo >> 31));
             else if constexpr (bitShifts == 33) return static_cast<out_type>((hi >> 1) + (hi & 1u));
             else                                return static_cast<out_type>(((hi >> (bitShifts - 33)) + 1u) >> 1);
@@ -1001,9 +1035,9 @@ public:
         {
             // Scale the input using integer multiplier
             calc_type output_val = static_cast<calc_type>(static_cast<calc_mul_type>(input_val) * M);
-            if constexpr (bias_needed_for(M) && !bias_fits_for(M))
+            if constexpr (round_by_shift_for(M))
             {
-                // Round half up without the bias add (see bias_fits_for). For bitShifts >= 2 the
+                // Round half up without the bias add (see round_by_shift_for). For bitShifts >= 2 the
                 // + 1 cannot overflow; for bitShifts == 1 use (A >> 1) + (A & 1) instead.
                 if constexpr (bitShifts >= 2)
                     return static_cast<out_type>(static_cast<calc_type>((output_val >> (bitShifts - 1)) + 1u) >> 1);
@@ -1136,9 +1170,9 @@ public:
                   "max_input_value * mult_factor_int would overflow calc_type — choose a wider calc_type or smaller max_input_value!");
 
     // Whether mult() applies the rounding bias (see bias_needed_for), and whether it is added
-    // before the shift (true) or done by the shift-based rounding (false, see bias_fits_for).
+    // before the shift (true) or done by the shift-based rounding (false, see round_by_shift_for).
     static constexpr bool rounding_bias_needed = bias_needed_for(mult_factor_int);
-    static constexpr bool rounding_bias_added  = rounding_bias_needed && bias_fits_for(mult_factor_int);
+    static constexpr bool rounding_bias_added  = rounding_bias_needed && !round_by_shift_for(mult_factor_int);
 
     // Precomputed maximum output: mult(max_input_int). Used by the clamp_input early-return path,
     // and exposed publicly so callers can query the maximum value mult() will ever return.
