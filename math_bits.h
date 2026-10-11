@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <bit>
+#include <numeric>
 
 // Force inlining of the hot path so the integer multiply-and-shift fuses into the caller.
 // GCC/Clang only (GNU attribute); other compilers ignore it. #undef'd at end of header.
@@ -133,6 +134,19 @@ struct mult_bitshift_options
     using out_type = void;
 };
 
+// An exact ratio num / den as multvalue, for scaling by a fraction without floating point:
+//     using ticks_to_ms = mult_bitshift<math_bits_ratio{1000, 48000}, 0xFFFFFFFFu>;
+// or, shorter, mult_bitshift_ratio<1000, 48000, 0xFFFFFFFFu> (below). mult() is then checked
+// against the exact integer result floor(x * num / den) (with trade_speed_for_precision:
+// floor(x * num / den + 1/2)), not against a floating-point expression. The ratio is reduced
+// (1000/48000 -> 1/48); it must not reduce to an integer (den 1): integer multiplication is not
+// supported, the compiler already does it optimally.
+struct math_bits_ratio
+{
+    uint64_t num;
+    uint64_t den;
+};
+
 namespace math_bits_detail
 {
     // Minimal unsigned 128-bit integer for exact compile-time arithmetic (parameter derivation and
@@ -216,22 +230,107 @@ namespace math_bits_detail
         return { static_cast<uint64_t>(v), e };
     }
 
-    // Sign of (f * k * 2^sh) - n, evaluated exactly: compares multvalue * k * 2^sh with integer n.
-    constexpr int cmp_scaled(const dyadic& f, uint64_t k, int sh, const u128& n)
+    // The exact multiplier as a positive value num / den * 2^exp (den >= 1). A floating-point
+    // multvalue is its exact binary value mant * 2^exp (den = 1, see decompose).
+    struct rational
     {
-        const u128 p = mul64(f.mant, k);
-        const int t = f.exp + sh;
-        if (t >= 0)
-        {
-            if (p.bit_width() + t > 128) return 1;           // p * 2^t >= 2^128 > n
-            const u128 l = p << t;
-            return n < l ? 1 : (l == n ? 0 : -1);
+        uint64_t num;
+        uint64_t den;
+        int      exp;
+    };
+
+    // Quotient and remainder of n / d, for d >= 1 (bit by bit; compile time only).
+    struct u128_divmod
+    {
+        u128     quot;
+        uint64_t rem;
+    };
+
+    constexpr u128_divmod divmod(const u128& n, uint64_t d)
+    {
+        if (n.hi == 0) return { u128(n.lo / d), n.lo % d };
+        if ((d >> 32) == 0)                                               // base-2^32 long division:
+        {                                                                 // r < d < 2^32, so r * 2^32 + digit fits
+            const uint64_t digit[4] = { n.hi >> 32, n.hi & 0xFFFFFFFFu, n.lo >> 32, n.lo & 0xFFFFFFFFu };
+            uint64_t qd[4] = {}, r = 0;
+            for (int i = 0; i < 4; ++i)
+            {
+                const uint64_t cur = (r << 32) | digit[i];
+                qd[i] = cur / d;
+                r = cur % d;
+            }
+            return { u128((qd[0] << 32) | qd[1], (qd[2] << 32) | qd[3]), r };
         }
-        const int s = -t;                                     // compare p with n * 2^s
-        if (n.bit_width() == 0) return p.bit_width() ? 1 : 0;
-        if (n.bit_width() + s > 128) return -1;               // n * 2^s >= 2^128 > p
-        const u128 r = n << s;
-        return r < p ? 1 : (p == r ? 0 : -1);
+        u128 q;
+        uint64_t r = 0;
+        for (int i = n.bit_width() - 1; i >= 0; --i)
+        {
+            const bool carry = (r >> 63) != 0;                            // 2 * r overflows 64 bits
+            r = (r << 1) | (((i >= 64) ? (n.hi >> (i - 64)) : (n.lo >> i)) & 1u);
+            q = q << 1;
+            if (carry || r >= d) { r -= d; q = q + u128(1); }           // exact mod 2^64: 2 * r < 2 * d
+        }
+        return { q, r };
+    }
+
+    // Inverse of a modulo m: a * inv == 1 (mod m), for gcd(a, m) == 1 and 2 <= m < 2^62 (extended
+    // Euclid; the coefficients stay below m in magnitude, so they fit int64_t).
+    constexpr uint64_t mod_inverse(uint64_t a, uint64_t m)
+    {
+        int64_t t = 0, nt = 1;
+        uint64_t r = m, nr = a % m;
+        while (nr != 0)
+        {
+            const uint64_t q = r / nr;
+            const int64_t tt = t - static_cast<int64_t>(q) * nt;
+            t = nt; nt = tt;
+            const uint64_t rr = r - q * nr;
+            r = nr; nr = rr;
+        }
+        return t < 0 ? static_cast<uint64_t>(t + static_cast<int64_t>(m)) : static_cast<uint64_t>(t);
+    }
+
+    // Sign of (a * b * 2^da) - (c * d * 2^dc), exact, for a, c < 2^128, b, d < 2^64 and any shifts
+    // (also negative). The products have at most 192 bits; after taking out the common power of two
+    // only one side is shifted, and only when both sides have the same bit width, so 256 bits suffice.
+    constexpr int cmp_scaled_products(const u128& a, uint64_t b, int da, const u128& c, uint64_t d, int dc)
+    {
+        auto product = [](const u128& x, uint64_t y, uint64_t (&w)[4])
+        {
+            const u128 lo = mul64(x.lo, y), hi = mul64(x.hi, y);
+            const uint64_t w1 = lo.hi + hi.lo;
+            w[0] = lo.lo; w[1] = w1; w[2] = hi.hi + (w1 < lo.hi ? 1u : 0u); w[3] = 0;
+        };
+        auto width = [](const uint64_t (&w)[4])
+        {
+            for (int i = 3; i >= 0; --i)
+                if (w[i]) return 64 * i + static_cast<int>(std::bit_width(w[i]));
+            return 0;
+        };
+        auto shift_left = [](uint64_t (&w)[4], int n)                     // result known to fit
+        {
+            const int ws = n / 64, bs = n % 64;
+            for (int i = 3; i >= 0; --i)
+            {
+                uint64_t v = (i - ws >= 0) ? (w[i - ws] << bs) : 0u;
+                if (bs && i - ws - 1 >= 0) v |= w[i - ws - 1] >> (64 - bs);
+                w[i] = v;
+            }
+        };
+        uint64_t L[4], R[4];
+        product(a, b, L);
+        product(c, d, R);
+        const int wl = width(L), wr = width(R);
+        if (wl == 0 || wr == 0) return wl ? 1 : (wr ? -1 : 0);
+        const int m = da < dc ? da : dc;
+        da -= m;
+        dc -= m;
+        if (wl + da != wr + dc) return (wl + da > wr + dc) ? 1 : -1;
+        if (da)      shift_left(L, da);
+        else if (dc) shift_left(R, dc);
+        for (int i = 3; i >= 0; --i)
+            if (L[i] != R[i]) return L[i] > R[i] ? 1 : -1;
+        return 0;
     }
 
     // q value for cmp_mul_plus_pow2: no 2^q term.
@@ -382,7 +481,9 @@ public:
 
     static constexpr float_type mult_factor = MultType::mult_factor;        // Floating-point multiplier
 
-    // Reference result for `input`: what the floating-point expression gives, evaluated in
+    // Reference result for `input`. For a ratio P/Q the exact integer result floor(x * P / Q)
+    // (with trade_speed_for_precision floor(x * P / Q + 1/2)). For a floating-point multvalue,
+    // what the floating-point expression gives, evaluated in
     // multvalue's own type T with IEEE rounding (to nearest, ties to even) at every step:
     //   truncation (default):          (out_type)( (T)input * multvalue )
     //   trade_speed_for_precision:     (out_type)( (T)input * multvalue + (T)0.5 )
@@ -393,19 +494,21 @@ public:
     // guess in level_start().
     static constexpr long double reference_bias = MultType::trade_speed_for_precision ? 0.5L : 0.0L;
     static constexpr int reference_precision = std::numeric_limits<float_type>::digits;
+    // multvalue = mant * 2^exp as the IEEE emulation takes it (f_value.den is 1 for a floating-point multvalue).
+    static constexpr math_bits_detail::dyadic f_ieee = { MultType::f_value.num, MultType::f_value.exp };
 
     // Per-configuration constants for a cheap reference (it runs for every self-test sample, and
     // GCC limits the operations of a constant evaluation). value = v / 2^ref_k, with v = x * mant
     // (+ 2^(ref_k-1) for the bias). ref_step bounds the IEEE rounding steps for every x <= max_input
     // (in units of 2^-ref_k): a value can only be rounded up onto the next integer when its
     // fractional bits from ref_step upward are all ones; only then is the full emulation needed.
-    static constexpr int ref_k = -MultType::f_dyadic.exp;
+    static constexpr int ref_k = -f_ieee.exp;
     static constexpr bool ref_has_bias = MultType::trade_speed_for_precision;
     static constexpr int calc_ref_step()
     {
     	using math_bits_detail::u128;
     	if (ref_k <= 0 || ref_k >= 120) return 0;
-    	const u128 pmax = math_bits_detail::mul64(static_cast<uint64_t>(MultType::max_input_int), MultType::f_dyadic.mant);
+    	const u128 pmax = math_bits_detail::mul64(static_cast<uint64_t>(MultType::max_input_int), f_ieee.mant);
     	const int sp = pmax.bit_width() - reference_precision;
     	const int ss = ref_has_bias ? (pmax + (u128(1) << (ref_k - 1))).bit_width() + 1 - reference_precision : sp;
     	return sp > ss ? sp : ss;
@@ -417,9 +520,20 @@ public:
     static constexpr out_type reference(io_type input)
     {
     	using math_bits_detail::u128;
-    	if constexpr (ref_fast)
+    	if constexpr (MultType::is_ratio)
     	{
-    		u128 v = math_bits_detail::mul64(static_cast<uint64_t>(input), MultType::f_dyadic.mant);
+    		// Exact: floor(x * P / Q), or with the bias floor(x * P / Q + 1/2) = q + (2r >= Q).
+    		constexpr math_bits_detail::rational f = MultType::f_value;
+    		const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(
+    			math_bits_detail::mul64(static_cast<uint64_t>(input), f.num), f.den);
+    		if constexpr (ref_has_bias)
+    			return static_cast<out_type>(qr.rem >= f.den - qr.rem ? qr.quot.lo + 1u : qr.quot.lo);
+    		else
+    			return static_cast<out_type>(qr.quot.lo);
+    	}
+    	else if constexpr (ref_fast)
+    	{
+    		u128 v = math_bits_detail::mul64(static_cast<uint64_t>(input), f_ieee.mant);
     		if constexpr (ref_has_bias) v = v + (u128(1) << (ref_k - 1));
     		const u128 q = v >> ref_k;                          // exact floor
     		if constexpr (ref_step > 0 && !reference_exact)     // exact reference: nothing is rounded
@@ -443,14 +557,14 @@ public:
     			}
     			if (near)
     				return static_cast<out_type>(math_bits_detail::ieee_mul_floor_full(static_cast<uint64_t>(input),
-    					MultType::f_dyadic, reference_precision, ref_has_bias).lo);
+    					f_ieee, reference_precision, ref_has_bias).lo);
     		}
     		return static_cast<out_type>(q.lo);
     	}
     	else
     	{
     		return static_cast<out_type>(math_bits_detail::ieee_mul_floor(static_cast<uint64_t>(input),
-    			MultType::f_dyadic, reference_precision, ref_has_bias).lo);
+    			f_ieee, reference_precision, ref_has_bias).lo);
     	}
     }
 
@@ -519,28 +633,40 @@ public:
     static constexpr long double worst_deviation =
     	static_cast<long double>(MultType::max_input_int) * abs_quant_error;
 
-    // Exact quantization error, from multvalue = m * 2^E and M = mult_factor_int at shift s:
-    //   |e| = |M/2^s - f| = num / 2^den_exp,  num = |M * 2^(-E-s) - m|,  den_exp = -E.
-    // e is exactly 0 when E + s >= 0 (M is then m * 2^(E+s)).
+    // Exact quantization error, from f = n/d * 2^E (MultType::f_value) and M = mult_factor_int at
+    // shift s:  |e| = |M/2^s - f| = num / (den * 2^den_exp), with t = E + s:
+    //   t >= 0:  num = |M*d - n*2^t|,      den = d, den_exp = s
+    //   t <  0:  num = |M*d*2^-t - n|,     den = d, den_exp = -E
+    // For a floating-point multvalue (d = 1), e is exactly 0 when t >= 0 (M is then n * 2^t).
     struct exact_quant_error
     {
     	math_bits_detail::u128 num;   // 0 when the multiplier is exact
+    	uint64_t den;
     	int  den_exp;
+    	bool high;                    // e >= 0: mult() never runs low
     };
 
     static constexpr exact_quant_error calc_exact_quant_error()
     {
     	using math_bits_detail::u128;
-    	const math_bits_detail::dyadic f = MultType::f_dyadic;
-    	const int k = -(f.exp + MultType::bitShifts);
-    	if (k <= 0) return { u128(0), 0 };
-    	const u128 M = static_cast<uint64_t>(MultType::mult_factor_int);
-    	// M * 2^k is within 2^(k-1) of m < 2^64 and k <= 127, so it fits; guard anyway: an
-    	// unrepresentable error is treated as huge (nothing proven, everything checked).
-    	if (M.bit_width() + k > 128) return { u128(~uint64_t{0}, ~uint64_t{0}), -f.exp };
-    	const u128 a = M << k;
-    	const u128 m = f.mant;
-    	return { (m < a) ? a - m : m - a, -f.exp };
+    	constexpr math_bits_detail::rational f = MultType::f_value;
+    	const int t = f.exp + MultType::bitShifts;
+    	const u128 Md = math_bits_detail::mul64(static_cast<uint64_t>(MultType::mult_factor_int), f.den);
+    	// An unrepresentable error is treated as huge (nothing proven, everything checked).
+    	constexpr exact_quant_error huge = { u128(~uint64_t{0}, ~uint64_t{0}), f.den, -f.exp, false };
+    	if (t >= 0)
+    	{
+    		if (f.den == 1) return { u128(0), 1, 0, true };
+    		if (64 + t > 128) return huge;
+    		const u128 n = u128(f.num) << t;
+    		return { (n < Md) ? Md - n : n - Md, f.den, MultType::bitShifts, !(Md < n) };
+    	}
+    	const int k = -t;
+    	// For d = 1, M * 2^k is within 2^(k-1) of n < 2^64 and k <= 127, so it fits; guard anyway.
+    	if (Md.bit_width() + k > 128) return huge;
+    	const u128 a = Md << k;
+    	const u128 n = f.num;
+    	return { (n < a) ? a - n : n - a, f.den, -f.exp, !(a < n) };
     }
 
     static constexpr exact_quant_error exact_error = calc_exact_quant_error();
@@ -549,7 +675,7 @@ public:
     // floor(max_input * f), exact.
     static constexpr math_bits_detail::u128 calc_max_product_floor()
     {
-    	const math_bits_detail::dyadic f = MultType::f_dyadic;
+    	const math_bits_detail::dyadic f = f_ieee;
     	const math_bits_detail::u128 p = math_bits_detail::mul64(static_cast<uint64_t>(MultType::max_input_int), f.mant);
     	return f.exp >= 0 ? (p << f.exp) : (p >> -f.exp);
     }
@@ -559,7 +685,8 @@ public:
     // does product + 0.5.
     static constexpr bool calc_reference_exact()
     {
-    	const math_bits_detail::dyadic f = MultType::f_dyadic;
+    	if constexpr (MultType::is_ratio) return true;                  // exact integer reference
+    	const math_bits_detail::dyadic f = f_ieee;
     	const int P = reference_precision;
     	const int bw_in = static_cast<int>(std::bit_width(static_cast<uint64_t>(MultType::max_input_int)));
     	uint64_t m_odd = f.mant;
@@ -582,16 +709,39 @@ public:
     	(calc_max_product_floor() + math_bits_detail::u128(2)).bit_width() - reference_precision + 1;
 
     // Sign of (x * |e| + rho_bound) - k, exact (rho_bound = 0 when the reference is exact,
-    // else 2^rho_exp). Everything is scaled by 2^den_exp to stay in integers.
+    // else 2^rho_exp). Everything is scaled by den * 2^den_exp to stay in integers; rho only occurs
+    // with the IEEE reference, where den = 1.
     static constexpr int cmp_deviation(uint64_t x, uint64_t k)
     {
+    	static_assert(reference_exact || exact_error.den == 1, "rho term requires den == 1");
     	constexpr int q = reference_exact ? math_bits_detail::no_pow2_term : rho_exp + exact_error.den_exp;
-    	return math_bits_detail::cmp_mul_plus_pow2(exact_error.num, x, q, math_bits_detail::u128(k), exact_error.den_exp);
+    	return math_bits_detail::cmp_mul_plus_pow2(exact_error.num, x, q, math_bits_detail::mul64(k, exact_error.den),
+    	                                           exact_error.den_exp);
     }
 
-    // Proven OK: max_input * |e| + rho_bound <= max_error, so ceil(worst deviation) <= max_error.
+    // Ratio only: proven exact for every input. x * P / Q has fractional parts in steps of 1/Q
+    // (x * P / Q + 1/2 in steps of 1/(2Q)), so a multiplier that runs high by less than one step
+    // never reaches the next integer, and mult(x) equals the reference for every x <= max_input:
+    //   0 <= max_input * e < 1/Q (1/(2Q))  <=>  e >= 0  and  max_input * num < 2^s (2^(s-1)),
+    // with e = num / (Q * 2^s) (exact_quant_error). The classic division-by-a-constant argument.
+    static constexpr bool calc_ratio_exact()
+    {
+    	if constexpr (!MultType::is_ratio || !analysis_applies) return false;
+    	else
+    	{
+    		constexpr int s = MultType::bitShifts - (MultType::trade_speed_for_precision ? 1 : 0);
+    		return exact_error.high && exact_error.den_exp == MultType::bitShifts
+    			&& math_bits_detail::cmp_scaled_products(exact_error.num, static_cast<uint64_t>(MultType::max_input_int), 0,
+    			                                         math_bits_detail::u128(1), 1, s) < 0;
+    	}
+    }
+    static constexpr bool ratio_exact = calc_ratio_exact();
+
+    // Proven OK: max_input * |e| + rho_bound <= max_error, so ceil(worst deviation) <= max_error;
+    // or, for a ratio, proven exact (ratio_exact).
     static constexpr bool proven_ok = analysis_applies
-    	&& cmp_deviation(static_cast<uint64_t>(MultType::max_input_int), static_cast<uint64_t>(max_deviation)) <= 0;
+    	&& (ratio_exact
+    	    || cmp_deviation(static_cast<uint64_t>(MultType::max_input_int), static_cast<uint64_t>(max_deviation)) <= 0);
 
     // Largest input x <= max_input with x * |e| + rho_bound <= max_error: inputs up to here cannot
     // exceed max_error (0 when even x = 0 is not provable; x = 0 always gives 0 on both sides).
@@ -644,6 +794,19 @@ public:
     static constexpr uint64_t level_start(uint64_t n)
     {
     	constexpr uint64_t x_max = MultType::max_input_int;
+    	if constexpr (MultType::is_ratio)
+    	{
+    		// Exact. floor(x*P/Q) >= n  <=>  x*P >= n*Q;  with the bias floor(x*P/Q + 1/2) >= n
+    		// <=>  2*x*P >= (2n-1)*Q  <=>  x*P >= (n-1)*Q + ceil(Q/2) (n >= 1). So x = ceil(V / P).
+    		// No overflow: n < 2^64 and Q < 2^64, so V + P - 1 < 2^128.
+    		using math_bits_detail::u128;
+    		constexpr math_bits_detail::rational f = MultType::f_value;
+    		if (n == 0) return 0;
+    		const u128 V = ref_has_bias ? math_bits_detail::mul64(n - 1, f.den) + u128(f.den - f.den / 2)
+    		                             : math_bits_detail::mul64(n, f.den);
+    		const u128 x = math_bits_detail::divmod(V + u128(f.num - 1), f.num).quot;
+    		return (x.hi != 0 || x.lo > x_max) ? x_max : x.lo;
+    	}
     	const long double g = (static_cast<long double>(n) - reference_bias) / static_cast<long double>(mult_factor);
     	uint64_t x = 0;
     	if (g > 0)
@@ -656,9 +819,112 @@ public:
     	return x;
     }
 
+    // ---- Ratio: exact check by residues ----
+    // For a ratio P/Q, mult(x) = floor(x*P/Q + x*e [+ 1/2]) and reference(x) = floor(x*P/Q [+ 1/2]).
+    // The fractional part of x*P/Q [+ 1/2] is v/S, where v depends only on the residue r = x*P mod Q
+    // (S = Q and v = r; with the bias S = 2Q and v = (2r + Q) mod 2Q), and x*e grows with x. So for
+    // each residue the worst input is the largest x <= max_input with that residue, and only
+    // residues whose fractional part is close enough to the next integer (e >= 0) or to 0 (e < 0)
+    // can fail at all (k = max_error):
+    //   e >= 0:  error >= k+1   needs  v >= S*(k+1) - S*max_input*e
+    //   e <  0:  error <= -(k+1) needs  v <  S*max_input*|e| - S*k
+    // Checking the worst input of each such residue (found with the inverse of P mod Q) is therefore
+    // exact for every input <= max_input, without sampling. Used when at most residue_budget
+    // residues qualify; otherwise the level walk below runs as for a floating-point multvalue.
+    struct residue_plan
+    {
+    	bool     applies;              // false: use the level walk
+    	uint64_t lo[2], hi[2];        // candidate residues [lo[i], hi[i]] (empty when lo > hi)
+    };
+    static constexpr uint64_t residue_budget = max_loop_iterations;
+
+    static constexpr residue_plan calc_residue_plan()
+    {
+    	constexpr residue_plan walk = { false, { 1, 1 }, { 0, 0 } };
+    	constexpr residue_plan none = { true,  { 1, 1 }, { 0, 0 } };    // no residue can fail
+    	if constexpr (!MultType::is_ratio) return walk;
+    	else
+    	{
+    		using math_bits_detail::u128;
+    		constexpr uint64_t Q = MultType::f_value.den;
+    		constexpr int s = MultType::bitShifts;
+    		if (Q >= (uint64_t{1} << 61) || exact_error.den_exp != s || exact_error.num.hi != 0) return walk;
+    		const uint64_t S = ref_has_bias ? 2 * Q : Q;
+    		// S * max_input * |e| = T / 2^s  (|e| = num / (Q * 2^s))
+    		u128 T = math_bits_detail::mul64(exact_error.num.lo, static_cast<uint64_t>(MultType::max_input_int));
+    		if (ref_has_bias)
+    		{
+    			if (T.hi >> 63) return walk;
+    			T = T << 1;
+    		}
+    		const u128 w_floor = T >> s;
+    		const u128 w_ceil  = ((w_floor << s) == T) ? w_floor : w_floor + u128(1);
+    		const u128 Sk = math_bits_detail::mul64(S, static_cast<uint64_t>(max_deviation));
+    		uint64_t v_lo, v_hi;                                         // candidate v in [v_lo, v_hi]
+    		if (exact_error.high)
+    		{
+    			const u128 Sk1 = Sk + u128(S);
+    			const u128 V = (w_floor < Sk1) ? Sk1 - w_floor : u128(0);
+    			if (V.hi != 0 || V.lo >= S) return none;
+    			v_lo = V.lo;
+    			v_hi = S - 1;
+    		}
+    		else
+    		{
+    			if (!(Sk < w_ceil)) return none;
+    			const u128 V = w_ceil - Sk;                              // v < V
+    			v_lo = 0;
+    			v_hi = (V.hi != 0 || V.lo > S) ? S - 1 : V.lo - 1;
+    		}
+    		residue_plan p = none;
+    		if constexpr (!ref_has_bias)
+    		{
+    			p.lo[0] = v_lo;
+    			p.hi[0] = v_hi;
+    		}
+    		else
+    		{
+    			const uint64_t h = (Q + 1) / 2;                          // r < h: v = 2r + Q, else v = 2r - Q
+    			if (v_hi >= Q)
+    			{
+    				const uint64_t hi = (v_hi - Q) / 2;
+    				p.lo[0] = (v_lo > Q) ? (v_lo - Q + 1) / 2 : 0;
+    				p.hi[0] = (hi < h - 1) ? hi : h - 1;
+    			}
+    			const uint64_t lo = (v_lo + Q + 1) / 2, hi = (v_hi + Q) / 2;
+    			p.lo[1] = (lo > h) ? lo : h;
+    			p.hi[1] = (hi < Q - 1) ? hi : Q - 1;
+    		}
+    		uint64_t count = 0;
+    		for (int i = 0; i < 2; ++i)
+    			if (p.lo[i] <= p.hi[i]) count += p.hi[i] - p.lo[i] + 1;
+    		return (count > residue_budget) ? walk : p;
+    	}
+    }
+    static constexpr residue_plan residue = calc_residue_plan();
+
+    // Check the worst input of every candidate residue (see calc_residue_plan).
+    static constexpr bool residue_ok()
+    {
+    	constexpr uint64_t Q = MultType::f_value.den, x_max = MultType::max_input_int;
+    	constexpr uint64_t p_inv = math_bits_detail::mod_inverse(MultType::f_value.num % Q, Q);
+    	for (int i = 0; i < 2; ++i)
+    	{
+    		if (residue.lo[i] > residue.hi[i]) continue;
+    		for (uint64_t r = residue.lo[i]; r <= residue.hi[i]; ++r)
+    		{
+    			const uint64_t x0 = math_bits_detail::divmod(math_bits_detail::mul64(r, p_inv), Q).rem;   // x0 * P == r (mod Q)
+    			if (x0 > x_max) continue;
+    			if (!number_ok(static_cast<io_type>(x0 + (x_max - x0) / Q * Q))) return false;
+    		}
+    	}
+    	return true;
+    }
+
     static constexpr bool gray_zone_ok()
     {
     	if constexpr (!analysis_applies || proven_ok) return true;
+    	else if constexpr (residue.applies) return residue_ok();
     	else
     	{
     		constexpr uint64_t x_max = MultType::max_input_int;
@@ -706,8 +972,11 @@ public:
     // Output type: Options::out_type, or io_type when that is void (the default).
     using out_type = std::conditional_t<std::is_void_v<typename Options::out_type>,
                                         IoType, typename Options::out_type>;
-    // Define the type of the multiplier (float, double, or long double)
-    using float_type = decltype(multvalue);
+    // multvalue is an exact ratio (math_bits_ratio) or a floating-point value.
+    static constexpr bool is_ratio = std::is_same_v<std::remove_cv_t<decltype(multvalue)>, math_bits_ratio>;
+    // Type of the multiplier (float, double, or long double); long double for a ratio, where it
+    // only types the informational mult_factor.
+    using float_type = std::conditional_t<is_ratio, long double, std::remove_cv_t<decltype(multvalue)>>;
     using options = Options;
     using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, Options>;
 
@@ -726,14 +995,31 @@ public:
     static_assert(Options::max_error <= static_cast<uint64_t>(std::numeric_limits<out_type>::max()),
                   "Options::max_error does not fit in out_type!");
 
-    // multvalue = f_dyadic.mant * 2^f_dyadic.exp, exactly. The parameter derivation below works on
-    // this in exact integer arithmetic (math_bits_detail), so no long double rounding is involved.
-    static constexpr math_bits_detail::dyadic f_dyadic = math_bits_detail::decompose(multvalue);
+    // The exact multiplier, f = f_value.num / f_value.den * 2^f_value.exp: a ratio reduced to lowest
+    // terms (exp = 0), or the exact binary value of a floating-point multvalue (den = 1). The parameter
+    // derivation and the error analysis below work on it in exact integer arithmetic
+    // (math_bits_detail), so no long double rounding is involved.
+    static constexpr math_bits_detail::rational f_value = []
+    {
+        if constexpr (is_ratio)
+        {
+            // An invalid ratio gets a harmless value here; calc_bitshifts reports it.
+            if (multvalue.num == 0 || multvalue.den == 0) return math_bits_detail::rational{ 1, 1, 0 };
+            const uint64_t g = std::gcd(multvalue.num, multvalue.den);
+            return math_bits_detail::rational{ multvalue.num / g, multvalue.den / g, 0 };
+        }
+        else
+        {
+            const math_bits_detail::dyadic d = math_bits_detail::decompose(multvalue);
+            return math_bits_detail::rational{ d.mant, 1, d.exp };
+        }
+    }();
 
-    // Sign of (multvalue * max_input_value * 2^sh) - n, evaluated exactly.
+    // Sign of (f * max_input_value * 2^sh) - n, evaluated exactly.
     static constexpr int cmp_product(int sh, math_bits_detail::u128 n)
     {
-        return math_bits_detail::cmp_scaled(f_dyadic, static_cast<uint64_t>(max_input_value), sh, n);
+        return math_bits_detail::cmp_scaled_products(f_value.num, static_cast<uint64_t>(max_input_value),
+                                                     f_value.exp + sh, n, f_value.den, 0);
     }
 
     // Validate the parameters, then return the shift: the largest s < digits(calc_type) with
@@ -742,12 +1028,20 @@ public:
     static constexpr uint8_t calc_bitshifts()
     {
         // Validate template parameters at compile-time
-        static_assert(std::is_floating_point_v<float_type>, "multvalue must be float, double, or long double");
+        if constexpr (is_ratio)
+        {
+            static_assert(multvalue.num != 0 && multvalue.den != 0, "math_bits_ratio: num and den must not be zero!");
+            static_assert(f_value.den != 1, "math_bits_ratio reduces to an integer: integer multiplication is not supported (the compiler already does it optimally)");
+        }
+        else
+        {
+            static_assert(std::is_floating_point_v<float_type>, "multvalue must be float, double, long double or math_bits_ratio");
+            static_assert(multvalue > 0, "multvalue must not be negative or zero!");
+        }
         static_assert(std::is_unsigned_v<io_type>, "io_type must be an unsigned integer type");
         static_assert(std::is_unsigned_v<calc_type>, "calc_type must be an unsigned integer type");
         static_assert(std::is_unsigned_v<decltype(max_input_value)>, "max_input_value must be an unsigned integer type");
 
-        static_assert(multvalue>0, "multvalue must not be negative or zero!");
         static_assert(max_input_value>0, "max_input_value must not be zero!");
 
         // Ensure max_input_value fits into io_type and calc_type
@@ -787,25 +1081,41 @@ public:
         return static_cast<uint8_t>(s);
     }
 
-    // multvalue * 2^bitShifts, exactly as 128-bit values: rounded down, and rounded half-up (nearest,
-    // the default). The nearest one fits calc_type, since multvalue * 2^bitShifts <= max(calc_type) / max_input.
+    // f * 2^bitShifts, exactly as 128-bit values: rounded down, and rounded half-up (nearest, the
+    // default). The nearest one fits calc_type, since f * 2^bitShifts <= max(calc_type) / max_input.
+    // With f = n/d * 2^E and t = E + bitShifts: floor(n * 2^t / d). For t < 0 the division by 2^-t
+    // comes after the one by d: floor(floor(n/d) / 2^-t) is the same value, and for the nearest one
+    // the fraction r/d < 1 cannot carry across the half (round half up of q/2^-t with q = floor(n/d)).
     static constexpr math_bits_detail::u128 calc_mult_floor()
     {
-        const int t = f_dyadic.exp + bitShifts;
-        const math_bits_detail::u128 m = f_dyadic.mant;
-        return t >= 0 ? (m << t) : (m >> -t);
+        const int t = f_value.exp + bitShifts;
+        const math_bits_detail::u128 m = f_value.num;
+        if constexpr (f_value.den == 1) return t >= 0 ? (m << t) : (m >> -t);
+        else return t >= 0 ? math_bits_detail::divmod(m << t, f_value.den).quot
+                           : (math_bits_detail::divmod(m, f_value.den).quot >> -t);
     }
     static constexpr math_bits_detail::u128 calc_mult_nearest()
     {
         using math_bits_detail::u128;
-        const int t = f_dyadic.exp + bitShifts;
-        const u128 m = f_dyadic.mant;
-        return t >= 0 ? (m << t) : ((m + (u128(1) << (-t - 1))) >> -t);
+        const int t = f_value.exp + bitShifts;
+        const u128 m = f_value.num;
+        if constexpr (f_value.den == 1) return t >= 0 ? (m << t) : ((m + (u128(1) << (-t - 1))) >> -t);
+        else if (t >= 0)
+        {
+            const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(m << t, f_value.den);
+            return qr.rem >= f_value.den - qr.rem ? qr.quot + u128(1) : qr.quot;   // 2r >= d
+        }
+        else return (math_bits_detail::divmod(m, f_value.den).quot + (u128(1) << (-t - 1))) >> -t;
     }
 
     // Template constants for internal calculations
     static constexpr out_type max_deviation{max_error};
-    static constexpr float_type mult_factor{multvalue};        // Floating-point multiplier
+    // Floating-point multiplier (for a ratio an approximation, informational only).
+    static constexpr float_type mult_factor = []
+    {
+        if constexpr (is_ratio) return static_cast<long double>(f_value.num) / static_cast<long double>(f_value.den);
+        else return multvalue;
+    }();
     static constexpr io_type max_input_int{max_input_value};   // Maximum allowed input
     static constexpr uint8_t bitShifts{calc_bitshifts()};     // Number of bits to shift
 
@@ -998,11 +1308,12 @@ public:
         using io_type    = typename mult_bitshift::io_type;
         using out_type   = typename mult_bitshift::out_type;
         using calc_type  = typename mult_bitshift::calc_type;
+        static constexpr bool       is_ratio        = mult_bitshift::is_ratio;
         static constexpr bool       trade_speed_for_precision = mult_bitshift::trade_speed_for_precision;
         static constexpr out_type   max_deviation   = static_cast<out_type>(E);
         static constexpr io_type    max_input_int   = mult_bitshift::max_input_int;
         static constexpr float_type mult_factor     = mult_bitshift::mult_factor;
-        static constexpr math_bits_detail::dyadic f_dyadic = mult_bitshift::f_dyadic;
+        static constexpr math_bits_detail::rational f_value = mult_bitshift::f_value;
         static constexpr uint8_t    bitShifts       = mult_bitshift::bitShifts;
         static constexpr calc_type  mult_factor_int = M;
         static constexpr out_type mult(io_type x) { return mult_bitshift::template mult_core<M>(x); }
@@ -1169,6 +1480,13 @@ using mult_bitshift_legacy = mult_bitshift<
     multvalue, max_input_value, IoType, CalcType,
     mult_bitshift_legacy_options<static_cast<uint64_t>(max_error), deep_test, clamp_input>
 >;
+
+// Exact ratio form: mult_bitshift_ratio<P, Q, max_input_value, ...> scales by P/Q (see
+// math_bits_ratio; the class reduces P/Q itself).
+template<uint64_t P, uint64_t Q, auto max_input_value,
+         typename IoType=uint32_t, typename CalcType=uint32_t,
+         typename Options = mult_bitshift_options>
+using mult_bitshift_ratio = mult_bitshift<math_bits_ratio{ P, Q }, max_input_value, IoType, CalcType, Options>;
 
 // D1 regression — locks in the invariant that the clamp boundary is monotonic
 // when both clamp_input and trade_speed_for_precision are on. Pre-fix, this assert

@@ -1,6 +1,6 @@
 # math_bits
 
-Header-only C++20 library for multiplying integers by a constant floating-point factor using integer bit-shifting — no FPU, no runtime division, compile-time unit tests.
+Header-only C++20 library for multiplying integers by a constant factor — a floating-point value or an exact ratio `P/Q` — using integer bit-shifting: no FPU, no runtime division, compile-time unit tests.
 
 ---
 
@@ -10,6 +10,7 @@ Header-only C++20 library for multiplying integers by a constant floating-point 
 - **Compile-time parameter generation** — multiplier, bit-shift count, and integer scale factor are all derived at compile time from the floating-point input.
 - **Overflow safe** — the maximum multiplication factor is computed at compile time to guarantee no overflow for the given input range.
 - **Configurable accuracy** — `max_error` (in the options traits class) sets the allowed deviation from the floating-point expression the scaler replaces. Defaults to ±1 LSB.
+- **Exact ratios** — `mult_bitshift_ratio<P, Q, …>` scales by the exact fraction `P/Q` and is checked against exact integer math `⌊x·P/Q⌋`; division-like ratios (`1/48000`, `3300/4095`, `1/3`) are typically *proven* exact for the whole input range.
 - **Compile-time unit tests** — a `static_assert` runs a full test suite at compile time. A broken instantiation will not compile.
 - **Header-only** — single `.h` file, no dependencies beyond the C++ standard library.
 - **Always-inlined hot path** — `mult()` is unconditionally `[[gnu::always_inline]]`, so the integer multiply-and-shift fuses into the caller with no extra flag.
@@ -40,6 +41,33 @@ uint16_t result = scale75::mult(800);  // result ≈ 600
 `multvalue` must be a floating-point constant (`0.75`, `1.0 / 1000`); it is only used at compile time, and the generated code is pure integer arithmetic. For integer gains, write `x * k` directly — GCC already produces optimal code. This library is for division and fractional factors, where it replaces a slow software division (on Cortex-M0/M0+) with an inline multiply and shift.
 
 **What `mult()` guarantees:** the same result as the floating-point expression it replaces — `(out_type)((T)x * multvalue)`, or `(out_type)((T)x * multvalue + 0.5)` with `trade_speed_for_precision` — evaluated in IEEE arithmetic of `multvalue`'s type `T` (as soft-float `double` on a Cortex-M0+ does), within `max_error` (default 1 LSB). Note that this is the *floating-point* result, quirks included: `0.7` is stored as `0.69999999999999995559…`, so in `double` code `10 * 0.7` gives `7` but `90 * 0.7` gives `62`. No fixed multiplier reproduces such a pattern exactly, so `max_error = 0` is not achievable for every constant; the compile-time check tells you.
+
+### Exact ratios (`mult_bitshift_ratio`)
+
+When the factor is really a fraction — downsampling by 3, ticks at 48 kHz to milliseconds, ADC counts to millivolts — give it as an exact ratio `P/Q` instead of a double:
+
+```cpp
+struct exact : mult_bitshift_options { static constexpr uint64_t max_error = 0; };
+
+// 48 kHz ticks -> ms over the full 32-bit range: exactly ticks * 1000 / 48000, proven for every input
+using ticks_to_ms = mult_bitshift_ratio<1000, 48000, 0xFFFFFFFFu, uint32_t, uint64_t, exact>;
+
+// 12-bit ADC -> mV: exactly x * 3300 / 4095
+using adc_to_mv   = mult_bitshift_ratio<3300, 4095, 4095u, uint16_t, uint32_t, exact>;
+
+// same as mult_bitshift<math_bits_ratio{7, 10}, ...>: 90 -> 63 (the double 0.7 gives 62 in double code)
+using times_0_7   = mult_bitshift_ratio<7, 10, 1000000u, uint32_t, uint64_t, exact>;
+```
+
+`mult_bitshift_ratio<P, Q, max_input_value, io_type, calc_type, Options>` is an alias for `mult_bitshift<math_bits_ratio{P, Q}, …>`; everything else (options, `mult()`, generated code) is the same as for a floating-point `multvalue`. Differences:
+
+- **Reference:** `mult()` is checked against the exact integer result `⌊x·P/Q⌋` (with `trade_speed_for_precision`: `⌊x·P/Q + ½⌋`) — no floating-point expression and none of its quirks.
+- **Exactness proof:** `x·P/Q` only has fractional parts in steps of `1/Q`, so a multiplier that runs high by less than one step can never reach the next integer: if `0 ≤ max_input_value · e < 1/Q` (`1/(2Q)` when rounding), `mult()` equals the reference for **every** input, proven without testing (the classic division-by-a-constant argument). Where the nearest multiplier would run low, the multiplier selection picks the rounded-up one. `max_error = 0` is then free.
+- **Exact check where the proof does not reach:** the error at `x` depends only on the residue `x·P mod Q` and grows with `x`, so per residue the worst input is the largest one with that residue, and only residues close enough to the next integer can fail at all. The self-test checks exactly those inputs (found with the inverse of `P` mod `Q`), which verifies every input up to `max_input_value` without sampling. It is used when at most 65536 residues qualify — always the case for denominators up to about 10⁵ such as 48000, 4095 or 1000; beyond that (e.g. `Q` around 10⁹ with a large error) the sampled check of a floating-point `multvalue` is used, with its sampling limit for `max_error = 0`.
+- `P/Q` is reduced (`1000/48000` → `1/48`); it must not reduce to an integer (integer multiplication is not supported — the compiler already does it optimally), and `P`, `Q` must not be 0.
+- `mult_factor` is only an informational `long double` approximation of `P/Q`; `is_ratio` is `true`.
+
+Exactness still needs enough multiplier bits: the multiplier must resolve `1/Q` steps over the whole input range, so huge input ranges need a 64-bit `calc_type` (see *Precision limit for large input ranges*) — e.g. `1/1000` over 32-bit inputs is proven exact with `calc_type = uint64_t`, but not over 40-bit inputs (only 33 multiplier bits are left; the self-test then reports the real error).
 
 ### Operator overload
 
@@ -119,7 +147,7 @@ New code should prefer the traits-class form — the legacy form is kept only to
 
 | Parameter | Default | Description |
 |---|---|---|
-| `multvalue` | — | Floating-point multiplier (`float`, `double`, or `long double`) |
+| `multvalue` | — | Floating-point multiplier (`float`, `double`, or `long double`), or an exact ratio `math_bits_ratio{P, Q}` (see `mult_bitshift_ratio`) |
 | `max_input_value` | — | Maximum input value the multiplier must handle without overflow |
 | `io_type` | `uint32_t` | Input integer type, and the output type unless `Options::out_type` is set. Must be unsigned. |
 | `calc_type` | `uint32_t` | Internal calculation type. Must be unsigned and at least as wide as `io_type` and `out_type`. |
@@ -167,7 +195,8 @@ For backwards compatibility, the previous positional signature is preserved as a
 
 | Constant | Description |
 |---|---|
-| `mult_factor` | The original floating-point multiplier |
+| `mult_factor` | The original floating-point multiplier (for a ratio an informational `long double` approximation) |
+| `is_ratio` | `true` when `multvalue` is an exact ratio (`math_bits_ratio`) |
 | `max_input_int` | The configured maximum input value |
 | `bitShifts` | Number of bits shifted in the integer multiplication |
 | `mult_factor_int` | The integer multiplier `mult()` uses (see *Multiplier selection*) |
@@ -215,6 +244,9 @@ The broad sweep still runs afterwards as an independent cross-check of the imple
 With `trade_speed_for_precision`, `mult()` normally adds the half-LSB bias `2^(bitShifts−1)` before the shift. When the product already fills the top of `calc_type` (`max_input_value × mult_factor_int + 2^(bitShifts−1)` would overflow), it rounds as `((x·M >> (bitShifts−1)) + 1) >> 1` instead: with `x·M = q·2^(bitShifts−1) + r` and `r < 2^(bitShifts−1)` both forms equal `⌊(q+1)/2⌋`, and the `+1` cannot overflow. So rounding never costs a bit of shift (precision), and such configurations compile instead of failing the `calc_type` overflow check.
 
 The shift form is also used where it gives shorter code: on cores that cannot add a large constant directly, the bias must first be built in a register. From `MATH_BITS_SHIFT_ROUND_MIN_BIAS` on — 256 on ARMv6-M (Cortex-M0/M0+: `adds` takes 0–255, larger needs `movs` + `lsls`), 65536 on ARMv8-M Baseline (Cortex-M23: `movw` loads 16-bit constants) — the shift form is one instruction shorter at `-Os` (1–3 at `-O2`, 6–9 at `-O0`; measured, never longer). In the 64-bit split multiply the constant compared is the part actually added (`2^(bitShifts−33)` to the high word, or `2^31` to the low word for `bitShifts = 32`). Other cores (e.g. Cortex-M3/M4/M7, whose `add` takes any power of two as an immediate) keep the add (threshold 0 = off). Predefine `MATH_BITS_SHIFT_ROUND_MIN_BIAS` to override the detection. Results are identical within the contract; inputs above `max_input_value` (without `clamp_input`) can differ, since the add can wrap in `calc_type` and the shift form does not.
+
+**Exact ratios**
+Internally the multiplier is the exact value `num/den · 2^exp`: a double is its exact binary value `mant/1 · 2^exp`, a ratio is `P/Q · 2^0` (reduced). Shift selection, multiplier candidates (`⌊P·2^s/Q⌋` and its neighbours, by exact 128-by-64-bit division), the exact quantization error `e = M/2^s − P/Q` and the gray-zone analysis all work on this value in exact integer arithmetic, so a ratio involves no floating point at all — the IEEE emulation is only used for the floating-point reference of a double `multvalue`. For a ratio the reference is exact (`ρ = 0`), the start of each output level is computed directly (`⌈n·Q/P⌉`), the `1/Q` exactness proof above proves `max_error = 0` without sampling, also for ranges far too large to test, and the residue check verifies the remaining configurations exactly. Verified against brute-force integer math on 400 random ratios × `max_error` 0/1/2 × both rounding modes: every exhaustively checkable verdict agrees with the truth.
 
 **Why waste one extra type parameter for `calc_type`?**
 The intermediate product `input * mult_factor_int` can overflow `io_type`. Using a wider `calc_type` (e.g. `uint32_t` when `io_type` is `uint16_t`) keeps the intermediate value safe and shifts back down to `out_type` at the end.
