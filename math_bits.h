@@ -48,7 +48,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <bit>
-#include <array>
 
 // Force inlining of the hot path so the integer multiply-and-shift fuses into the caller.
 // GCC/Clang only (GNU attribute); other compilers ignore it. #undef'd at end of header.
@@ -235,32 +234,12 @@ namespace math_bits_detail
         return r < p ? 1 : (p == r ? 0 : -1);
     }
 
-    // Sign of (a * b) - (c * 2^d), exact for any a < 2^128, b < 2^64, c < 2^128, d >= 0:
-    // a * b is formed as a 192-bit value, shifted right by d and compared with c (with the
-    // shifted-out bits deciding a tie), so nothing can overflow.
-    constexpr int cmp_mul_pow2(const u128& a, uint64_t b, const u128& c, int d)
-    {
-        const u128 lo = mul64(a.lo, b), hi = mul64(a.hi, b);
-        const uint64_t w1 = lo.hi + hi.lo;
-        const uint64_t w[3] = { lo.lo, w1, hi.hi + (w1 < lo.hi ? 1u : 0u) };   // a*b = w2:w1:w0
-
-        if (d >= 192) return (w[0] | w[1] | w[2]) ? (c.bit_width() ? -1 : 1) : (c.bit_width() ? -1 : 0);
-        const int ws = d / 64, bs = d % 64;
-        uint64_t q[3] = { 0, 0, 0 };                                              // q = (a*b) >> d
-        for (int i = 0; i + ws < 3; ++i)
-            q[i] = (w[i + ws] >> bs) | ((bs && i + ws + 1 < 3) ? (w[i + ws + 1] << (64 - bs)) : 0u);
-        bool rem = bs && (w[ws] & ((uint64_t{1} << bs) - 1));                     // shifted-out bits
-        for (int j = 0; j < ws; ++j) rem = rem || w[j];
-
-        if (q[2]) return 1;                                                       // q >= 2^128 > c
-        const u128 qq{ q[1], q[0] };
-        if (c < qq) return 1;
-        if (qq < c) return -1;
-        return rem ? 1 : 0;
-    }
+    // q value for cmp_mul_plus_pow2: no 2^q term.
+    inline constexpr int no_pow2_term = std::numeric_limits<int>::min();
 
     // Sign of (a * b + 2^q) - (c * 2^d), exact, for a < 2^128, b < 2^64, c < 2^128, 0 <= d, q < 192.
-    // q < 0 stands for a term strictly between 0 and 1. Uses 256-bit intermediates.
+    // q < 0 stands for a term strictly between 0 and 1; q == no_pow2_term for no term at all.
+    // Uses 256-bit intermediates, so nothing can overflow.
     constexpr int cmp_mul_plus_pow2(const u128& a, uint64_t b, int q, const u128& c, int d)
     {
         const u128 lo = mul64(a.lo, b), hi = mul64(a.hi, b);
@@ -286,7 +265,7 @@ namespace math_bits_detail
         }
         for (int i = 3; i >= 0; --i)
             if (L[i] != R[i]) return L[i] > R[i] ? 1 : -1;
-        return q < 0 ? 1 : 0;                                                     // equal integer parts
+        return (q < 0 && q != no_pow2_term) ? 1 : 0;                             // equal integer parts
     }
 
     // ---- IEEE 754 emulation (round to nearest, ties to even) ----------------------------------
@@ -389,7 +368,7 @@ public:
     static constexpr uint64_t max_loop_iterations = static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()) + 1;
     // Sample count for the sweep over [0, max_input_int]. Based on the input range rather than
     // io_type's range: when max_input_int + 1 fits under the cap, every input is tested exactly
-    // once (linspace step is then exactly 1); otherwise the range is sampled.
+    // once (the sweep step is then exactly 1); otherwise the range is sampled.
     static constexpr std::size_t calc_loop_iterations()
     {
     	constexpr uint64_t cap = test_in_depth ? max_loop_iterations : min_loop_iterations;
@@ -402,28 +381,6 @@ public:
     static constexpr std::size_t loop_iterations = calc_loop_iterations();
 
     static constexpr float_type mult_factor = MultType::mult_factor;        // Floating-point multiplier
-
-    // N is std::size_t, not calc_type: a narrow calc_type (e.g. uint8_t) would truncate the count.
-    template <std::size_t N, double start, double end>
-    static constexpr std::array<double, N> linspace() {
-        static_assert(N >= 2, "linspace requires N >= 2 (need at least two points to define a spacing)");
-
-        std::array<double, N> arr{};
-
-        const double step = (end - start) / (N - 1);
-
-        for (std::size_t i = 0; i < N; ++i)
-            arr[i] = start + i * step;
-
-        // Pin the endpoint exactly. Float (end-start)/(N-1) and i*step don't round-trip in general,
-        // so arr[N-1] could land slightly below `end`. The endpoint is exactly where the
-        // bitshift-multiply's input-scaled error term peaks; missing it by 1 LSB after the
-        // static_cast<io_type>(value) cast would silently weaken the static_assert sweep's
-        // coverage. arr[0] is already exact because `start + 0*step` is exactly `start`.
-        arr[N-1] = end;
-
-        return arr;
-    }
 
     // Reference result for `input`: what the floating-point expression gives, evaluated in
     // multvalue's own type T with IEEE rounding (to nearest, ties to even) at every step:
@@ -512,28 +469,23 @@ public:
     	return (res_actual >= res_min) && (res_actual <= res_max);
     }
 
+    // Broad sweep: loop_iterations evenly spaced inputs over [0, max_input_int] (every input when
+    // the range fits under the cap). Spacing is computed in double; the last sample is pinned to
+    // max_input_int exactly, since i * step can land just below it (missing the input with the
+    // largest error) and, for a 64-bit input, `stop` itself can round up past it (casting a
+    // double >= 2^64 to uint64_t is UB).
     static constexpr bool run_test()
     {
-    	constexpr double start = 0;
+    	constexpr std::size_t N = loop_iterations;          // >= 2, since max_input_int >= 1
     	constexpr double stop = MultType::max_input_int;
-    	constexpr std::size_t elementTestCount = loop_iterations;
+    	constexpr double step = stop / (N - 1);
 
-    	constexpr std::array<double, elementTestCount> values = linspace<elementTestCount, start, stop>();
-
-    	// The loop below casts each `value` (double) to io_type (unsigned). A negative
-    	// start would make that cast UB on the early samples — and the rest of the test
-    	// class (rounding bias direction, overflow comparisons, max_input_int as `stop`)
-    	// assumes non-negative inputs throughout. Revisit those before relaxing this.
-    	static_assert(start >= 0, "run_test() assumes start >= 0; revisit the loop body and rest of the test class before allowing negative test values.");
-
-    	for(auto value : values)
+    	for (std::size_t i = 0; i < N; ++i)
     	{
-    		// `stop` can round up past max_input_int for a 64-bit input (double has 53 bits),
-    		// and casting a double >= 2^64 to uint64_t is UB — so map the endpoint back exactly.
-    		io_type input = (value >= stop) ? MultType::max_input_int : static_cast<io_type>(value);
-    		if(!number_ok(input))	return false;
+    		const double value = i * step;
+    		const io_type input = (i == N - 1 || value >= stop) ? MultType::max_input_int : static_cast<io_type>(value);
+    		if (!number_ok(input)) return false;
     	}
-
     	return true;
     }
 
@@ -568,13 +520,12 @@ public:
     	static_cast<long double>(MultType::max_input_int) * abs_quant_error;
 
     // Exact quantization error, from multvalue = m * 2^E and M = mult_factor_int at shift s:
-    //   e = M/2^s - f = +-(num / 2^den_exp),  num = |M * 2^(-E-s) - m|,  den_exp = -E.
+    //   |e| = |M/2^s - f| = num / 2^den_exp,  num = |M * 2^(-E-s) - m|,  den_exp = -E.
     // e is exactly 0 when E + s >= 0 (M is then m * 2^(E+s)).
     struct exact_quant_error
     {
     	math_bits_detail::u128 num;   // 0 when the multiplier is exact
     	int  den_exp;
-    	bool positive;                // e > 0: mult() runs high
     };
 
     static constexpr exact_quant_error calc_exact_quant_error()
@@ -582,14 +533,14 @@ public:
     	using math_bits_detail::u128;
     	const math_bits_detail::dyadic f = MultType::f_dyadic;
     	const int k = -(f.exp + MultType::bitShifts);
-    	if (k <= 0) return { u128(0), 0, false };
+    	if (k <= 0) return { u128(0), 0 };
     	const u128 M = static_cast<uint64_t>(MultType::mult_factor_int);
     	// M * 2^k is within 2^(k-1) of m < 2^64 and k <= 127, so it fits; guard anyway: an
     	// unrepresentable error is treated as huge (nothing proven, everything checked).
-    	if (M.bit_width() + k > 128) return { u128(~uint64_t{0}, ~uint64_t{0}), -f.exp, true };
+    	if (M.bit_width() + k > 128) return { u128(~uint64_t{0}, ~uint64_t{0}), -f.exp };
     	const u128 a = M << k;
     	const u128 m = f.mant;
-    	return (m < a) ? exact_quant_error{ a - m, -f.exp, true } : exact_quant_error{ m - a, -f.exp, false };
+    	return { (m < a) ? a - m : m - a, -f.exp };
     }
 
     static constexpr exact_quant_error exact_error = calc_exact_quant_error();
@@ -634,11 +585,8 @@ public:
     // else 2^rho_exp). Everything is scaled by 2^den_exp to stay in integers.
     static constexpr int cmp_deviation(uint64_t x, uint64_t k)
     {
-    	if constexpr (reference_exact)
-    		return math_bits_detail::cmp_mul_pow2(exact_error.num, x, math_bits_detail::u128(k), exact_error.den_exp);
-    	else
-    		return math_bits_detail::cmp_mul_plus_pow2(exact_error.num, x, rho_exp + exact_error.den_exp,
-    		                                           math_bits_detail::u128(k), exact_error.den_exp);
+    	constexpr int q = reference_exact ? math_bits_detail::no_pow2_term : rho_exp + exact_error.den_exp;
+    	return math_bits_detail::cmp_mul_plus_pow2(exact_error.num, x, q, math_bits_detail::u128(k), exact_error.den_exp);
     }
 
     // Proven OK: max_input * |e| + rho_bound <= max_error, so ceil(worst deviation) <= max_error.
@@ -717,48 +665,19 @@ public:
     		// Inputs with x*|e| <= max_error cannot violate (exact threshold).
     		constexpr uint64_t x_lo = calc_x_safe();
 
+    		// Check both ends of each level (largest x: worst overshoot, smallest x: worst
+    		// undershoot), walking down from max_input. With an exact reference the error has the
+    		// sign of e, so only one end can fail; the other end's check then always passes.
     		uint64_t checked = 0;                        // levels checked
-    		if constexpr (!reference_exact)
+    		uint64_t x = x_max;
+    		while (checked < gray_zone_budget && x >= x_lo)
     		{
-    			// The IEEE rounding of the reference can push the error either way, so check both
-    			// ends of each level (largest x: worst overshoot, smallest x: worst undershoot),
-    			// walking down from max_input.
-    			uint64_t x = x_max;
-    			while (checked < gray_zone_budget && x >= x_lo)
-    			{
-    				if (!number_ok(static_cast<io_type>(x))) return false;
-    				const uint64_t start = level_start(reference(static_cast<io_type>(x)));
-    				if (start != x && !number_ok(static_cast<io_type>(start))) return false;
-    				++checked;
-    				if (start == 0 || start - 1 < x_lo) break;
-    				x = start - 1;
-    			}
-    		}
-    		else if constexpr (exact_error.positive)
-    		{
-    			// Exact reference: the error has the sign of e. Largest x of each level (mult runs
-    			// high), walking down from max_input.
-    			uint64_t x = x_max;
-    			while (checked < gray_zone_budget && x >= x_lo)
-    			{
-    				if (!number_ok(static_cast<io_type>(x))) return false;
-    				++checked;
-    				const uint64_t start = level_start(reference(static_cast<io_type>(x)));
-    				if (start == 0 || start - 1 < x_lo) break;
-    				x = start - 1;
-    			}
-    		}
-    		else
-    		{
-    			// Smallest x of each level, walking down from the top level.
-    			uint64_t x = level_start(reference(static_cast<io_type>(x_max)));
-    			while (checked < gray_zone_budget && x >= x_lo)
-    			{
-    				if (!number_ok(static_cast<io_type>(x))) return false;
-    				++checked;
-    				if (x == 0 || x - 1 < x_lo) break;
-    				x = level_start(reference(static_cast<io_type>(x - 1)));
-    			}
+    			if (!number_ok(static_cast<io_type>(x))) return false;
+    			const uint64_t start = level_start(reference(static_cast<io_type>(x)));
+    			if (start != x && !number_ok(static_cast<io_type>(start))) return false;
+    			++checked;
+    			if (start == 0 || start - 1 < x_lo) break;
+    			x = start - 1;
     		}
     		return true;
     	}
@@ -868,20 +787,20 @@ public:
         return static_cast<uint8_t>(s);
     }
 
-    // Multiplier candidates at shift bitShifts, computed exactly as 128-bit values (the rounded-up
-    // one can exceed calc_type; that is checked before it is used):
-    //   round == 0: round-half-up (nearest, the default), -1: rounded down, +1: rounded up.
-    // The nearest one fits calc_type, since multvalue * 2^bitShifts <= max(calc_type) / max_input.
-    static constexpr math_bits_detail::u128 calc_mult_candidate(int round)
+    // multvalue * 2^bitShifts, exactly as 128-bit values: rounded down, and rounded half-up (nearest,
+    // the default). The nearest one fits calc_type, since multvalue * 2^bitShifts <= max(calc_type) / max_input.
+    static constexpr math_bits_detail::u128 calc_mult_floor()
+    {
+        const int t = f_dyadic.exp + bitShifts;
+        const math_bits_detail::u128 m = f_dyadic.mant;
+        return t >= 0 ? (m << t) : (m >> -t);
+    }
+    static constexpr math_bits_detail::u128 calc_mult_nearest()
     {
         using math_bits_detail::u128;
         const int t = f_dyadic.exp + bitShifts;
         const u128 m = f_dyadic.mant;
-        if (t >= 0) return m << t;                                  // exact: all candidates equal
-        const int k = -t;
-        if (round == 0) return (m + (u128(1) << (k - 1))) >> k;
-        const u128 q = m >> k;
-        return (round > 0 && !((q << k) == m)) ? q + u128(1) : q;
+        return t >= 0 ? (m << t) : ((m + (u128(1) << (-t - 1))) >> -t);
     }
 
     // Template constants for internal calculations
@@ -1097,16 +1016,15 @@ public:
     }
 
     // Candidate multipliers, as exact 128-bit values. The alternative is the other rounding
-    // direction; when multvalue * 2^bitShifts is exactly an integer (both directions equal), it is
-    // one step above: the floating-point expression rounds each product to nearest, which can lift
-    // a product lying just below an integer onto it (e.g. 3000 * (1.0/3) -> 1000), and only a
-    // slightly larger multiplier reproduces that. (Rounding can never push a product below an
-    // integer, so one step below is never useful.)
-    static constexpr math_bits_detail::u128 mult_nearest_u128 = calc_mult_candidate(0);
+    // direction: one below when nearest rounded up, else one above. One above also covers an
+    // exact multvalue * 2^bitShifts (nearest == floor): the floating-point expression rounds each
+    // product to nearest, which can lift a product lying just below an integer onto it
+    // (e.g. 3000 * (1.0/3) -> 1000), and only a slightly larger multiplier reproduces that.
+    // (Rounding can never push a product below an integer, so one step below is never useful.)
+    static constexpr math_bits_detail::u128 mult_nearest_u128 = calc_mult_nearest();
     static constexpr math_bits_detail::u128 mult_alt_u128 =
-        (calc_mult_candidate(-1) != mult_nearest_u128) ? calc_mult_candidate(-1)
-      : (calc_mult_candidate(+1) != mult_nearest_u128) ? calc_mult_candidate(+1)
-      : mult_nearest_u128 + math_bits_detail::u128(1);
+        (mult_nearest_u128 == calc_mult_floor()) ? mult_nearest_u128 + math_bits_detail::u128(1)
+                                                 : calc_mult_floor();
 
     // True when the candidate is non-zero and max_input_value * candidate (+ bias) fits calc_type.
     // The bias room is still required for the alternative, although mult() could round without it
