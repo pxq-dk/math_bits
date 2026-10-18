@@ -11,7 +11,7 @@ Header-only C++20 library for multiplying integers by a constant factor — a fl
 - **Overflow safe** — the maximum multiplication factor is computed at compile time to guarantee no overflow for the given input range.
 - **Configurable accuracy** — `max_error` (in the options traits class) sets the allowed deviation from the floating-point expression the scaler replaces. Defaults to ±1 LSB.
 - **Exact ratios** — `mult_bitshift_ratio<P, Q, …>` scales by the exact fraction `P/Q` and is checked against exact integer math `⌊x·P/Q⌋`; division-like ratios (`1/48000`, `3300/4095`, `1/3`) are typically *proven* exact for the whole input range.
-- **Runtime gains** — `mult_bitshift_ratio_dyn` takes the ratio `num/den` at runtime (calibration), with a compile-time contract for `num` and `den`; shift, overflow safety and the error bound are proven at compile time for every gain the contract allows.
+- **Runtime gains** — `mult_bitshift_ratio_dyn` takes the ratio `num/den` at runtime (calibration), with a compile-time contract for `num` and `den`; shift, overflow safety and the error bound are proven at compile time for every gain the contract allows. With a fixed denominator (`num/4095`, `num/1000`, Q-format `num/4096`) only `num` is set, without a runtime division.
 - **Compile-time unit tests** — a `static_assert` runs a full test suite at compile time. A broken instantiation will not compile.
 - **Header-only** — single `.h` file, no dependencies beyond the C++ standard library.
 - **Always-inlined hot path** — `mult()` is unconditionally `[[gnu::always_inline]]`, so the integer multiply-and-shift fuses into the caller with no extra flag.
@@ -95,12 +95,13 @@ if (adc.set(cal_num, cal_den) == adc_scale::status::rejected) { /* old gain stil
 
 | Member | Default | Description |
 |---|---|---|
-| `num_min`, `num_max`, `den_min`, `den_max` | — (must be set) | The contract: `set()` / `prepare()` return `rejected` for `num` or `den` outside these ranges, and the old gain stays active. Need `den_min ≥ 1`, `num_max ≥ 1`. |
+| `num_min`, `num_max`, `den_min`, `den_max` | — (must be set) | The contract: `set()` / `prepare()` return `rejected` for `num` or `den` outside these ranges, and the old gain stays active. Need `den_min ≥ 1`, `num_max ≥ 1`. `den_min == den_max` makes the denominator fixed (see *Fixed denominator*). |
 | `gain_min`, `gain_max` | no restriction | Optional gain range (`math_bits_ratio`), tighter than the contract allows: a gain outside it is clamped to the limit (`clamp_gain`, status `clamped`) or rejected. |
 | `clamp_gain` | `false` | See `gain_min`, `gain_max`. |
+| `output_limit`, `clamp_output` | no limit, `false` | Limit for the result (e.g. DAC full scale; must fit `out_type`). Without `clamp_output`: compile-time check only — build error if `max_input_value` × any allowed gain can exceed it. With `clamp_output`: `mult()` saturates (`min(result, output_limit)`, about 6 instructions on Cortex-M0+) for every input, also above `max_input_value`; the error guarantee holds against `min(exact, output_limit)`. The saturation is dropped when the limit is unreachable and `clamp_input` is set. |
 | `topology` | `math_bits_topology::None<>` | Concurrency, with the names and members of RingBuffer_Cortex's `Topology` (whose types can be passed directly): producer = the context changing the gain, consumer = the context calling `mult()`. `None`, `SPSC`, `MPSC`, `SPMC`, `MPMC`, each with a lock type (default: PRIMASK, by inline assembly — no CMSIS needed). |
 
-**What is proven at compile time** (for every gain the contract and the gain range allow): `max_input_value × largest gain` fits `calc_type` and `out_type`, and every result is within `max_error` of the exact `⌊x·num/den⌋` (`⌊x·num/den + ½⌋` when rounding). The multiplier is rounded up, `M = ⌈num·2^s/den⌉`, so the error is never negative, and with the fractional parts of `x·num/den` in steps of `1/den` the guarantee follows from one inequality per denominator, `max_input · (den − 1) < (max_error · den + 1) · 2^s` (`2·max_input·(den−1) < (2·max_error·den + 1)·2^s` when rounding) — linear in `den`, so checking `den_min`, `den_max` (and clamping limits) covers all. Nothing is checked per gain at runtime except the contract. `max_error = 0` needs `2^s > max_input · (den_max − 1)`: e.g. a 12-bit ADC with `den_max = 4095` needs a 64-bit `calc_type`; with `uint32_t` `den_max` up to about 256 works. If it cannot be proven, the build fails and says what to change.
+**What is proven at compile time** (for every gain the contract and the gain range allow): `max_input_value × largest gain` fits `calc_type` and `out_type`, and every result is within `max_error` of the exact `⌊x·num/den⌋` (`⌊x·num/den + ½⌋` when rounding). The multiplier is rounded up, `M = ⌈num·2^s/den⌉`, so the error is never negative, and with the fractional parts of `x·num/den` in steps of `1/den` the guarantee follows from one inequality per denominator, `max_input · ρ < (max_error · den + 1) · 2^s` (`2·max_input·ρ < (2·max_error·den + 1)·2^s` when rounding), where `ρ = M·den − num·2^s` is the rounding residue of the multiplier. Over a range of denominators `ρ ≤ den − 1` — linear in `den`, so checking `den_min`, `den_max` covers all. For a single denominator (a fixed one, or a clamping limit) `ρ ≤ den − gcd(den, 2^s)`, since `ρ` is a multiple of that gcd: the same for an odd `den`, and `ρ = 0` (exact for any input range) for a power of two. Nothing is checked per gain at runtime except the contract. `max_error = 0` needs `2^s > max_input · (den_max − 1)`: e.g. a 12-bit ADC with `den_max = 4095` needs a 64-bit `calc_type`; with `uint32_t` `den_max` up to about 256 works. If it cannot be proven, the build fails and says what to change.
 
 | Function | Description |
 |---|---|
@@ -108,12 +109,31 @@ if (adc.set(cal_num, cal_den) == adc_scale::status::rejected) { /* old gain stil
 | `set(num, den)` | Check, compute and activate a new gain; returns `status::ok`, `clamped` or `rejected`. |
 | `prepare(num, den)` / `apply_new()` | Two-phase: `prepare` checks and computes into a pending slot (active gain unchanged); `apply_new` activates it (`false` if nothing is pending). |
 | `evaluate(num, den)` | Static, `constexpr`: the status and multiplier a gain would get, without changing anything. |
+| `set(num)`, `prepare(num)`, `evaluate(num)`, constructor `(num)` | Fixed denominator only: the same with `den = den_min`. |
 | `active_multiplier()` | The integer multiplier in use (for inspection). |
 | `bitShifts`, `mult_factor_int_max`, `gain_lo`, `gain_hi`, `m_type` | Compile-time constants: the shift, the largest multiplier, the gain range, the multiplier type. |
 
 **Concurrency:** `mult()` never takes a lock. A multiplier of up to 32 bits is one word, read and written atomically; a 64-bit one is kept in a double buffer with a sequence counter — the writer fills the slot readers are not using and then publishes with one atomic store; the reader re-reads if the gain changed while it read. So `SPSC` is safe in both directions (ISR writing and main reading, or the reverse). The lock (`MPSC`/`MPMC`) only serializes several producers, around the store — not around the division that computes the multiplier. The shift is chosen so the multiplier fits 32 bits whenever the error guarantee still holds there. Written for single-core Cortex-M (ordering by `volatile` accesses).
 
-**Cost** (Cortex-M0+, `-Os`): `mult()` 5 instructions / 1 `muls` (12-bit ADC, `calc_type = uint32_t`), 14 / 2 with `calc_type = uint64_t` and a 32-bit multiplier, 43 / 5 with a 64-bit multiplier (24-bit inputs, `den` up to 10⁶); `set()` about 32–44 instructions plus one `__aeabi_uldivmod` (only when the gain changes). Storage: one or two multipliers, the pending one and a flag.
+**Cost** (Cortex-M0+, `-Os`): `mult()` 5 instructions / 1 `muls` (12-bit ADC, `calc_type = uint32_t`), 14 / 2 with `calc_type = uint64_t` and a 32-bit multiplier, 43 / 5 with a 64-bit multiplier (24-bit inputs, `den` up to 10⁶); `set()` about 32–44 instructions plus one `__aeabi_uldivmod` (only when the gain changes), with a fixed denominator about 36–55 instructions and no call. Storage: one or two multipliers, the pending one and a flag.
+
+**Fixed denominator** (`den_min == den_max = D`): for gains of the form `num/D` — a calibrated reference over a fixed ADC full scale, `x·duty/PERIOD`, a Q12 gain `num/4096` — only `num` changes at runtime:
+
+```cpp
+struct adc_ref : mult_bitshift_ratio_dyn_options {
+    static constexpr uint64_t num_min = 3000, num_max = 3600;   // calibrated reference, mV
+    static constexpr uint64_t den_min = 4095, den_max = 4095;   // fixed: 12-bit full scale
+    static constexpr uint64_t max_error = 0;
+};
+using adc_mv = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, adc_ref>;
+
+constinit adc_mv adc{ 3300 };              // 3300 / 4095
+adc.set(cal_mV);                           // = set(cal_mV, 4095), no division
+```
+
+- **No runtime division in `set()`:** with `2^s = q0·D + r0` at compile time, `M = num·q0 + ⌈num·r0/D⌉`, and the remaining `⌈num·r0/D⌉` is a division by the constant `D` over the small range `num·r0 < num_max·D`, done as a multiply and shift that is proven exact for that range (the `1/D` argument above). It applies when `num_max · D` is below about 2³²; beyond that `set()` divides as for a range of denominators. A compile-time self-test checks the result against the exact `⌈num·2^s/D⌉` for every `num` of the contract (sampled beyond 4096 values, 65536 with `deep_test`).
+- **Any `D`:** the multiplier and the error guarantee are the same as with `den_min == den_max` before; the accuracy needs the same multiplier bits — an exact `x·num/4095` over 12-bit inputs still needs a 64-bit `calc_type` (`max_error = 1` works with `uint32_t`). For a power of two `D ≤ 2^s` the residue is 0, so e.g. a Q12 gain over 12-bit inputs is proven exact with `uint32_t` (rejected before, by the bound for a range of denominators), and `set()` reduces to a shift.
+- The two-argument forms still work (with `den` = `D`, anything else is `rejected`).
 
 ### Operator overload
 

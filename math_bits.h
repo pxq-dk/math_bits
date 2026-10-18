@@ -1588,6 +1588,13 @@ struct mult_bitshift_ratio_dyn_options : mult_bitshift_options
     static constexpr math_bits_ratio gain_min{ 0, 1 };
     static constexpr math_bits_ratio gain_max{ ~uint64_t{0}, 1 };
     static constexpr bool clamp_gain = false;
+    // Optional limit for the result of mult(), e.g. a DAC full scale or a timer period (must fit
+    // out_type; ~0 = no limit). clamp_output false: compile-time check only — the build fails when
+    // an input up to max_input_value with a gain the contract allows can give a larger result.
+    // clamp_output true: mult() saturates to the limit; no input (also none above max_input_value)
+    // gives a larger result, and the error guarantee holds against min(exact, output_limit).
+    static constexpr uint64_t output_limit = ~uint64_t{0};
+    static constexpr bool clamp_output = false;
     // Who changes the gain and who calls mult() (see math_bits_topology).
     using topology = math_bits_topology::None<>;
 };
@@ -1601,6 +1608,21 @@ namespace math_bits_detail
 
     template<typename T> MATH_BITS_ALWAYS_INLINE inline T vload(const T& r)        { return *static_cast<const volatile T*>(&r); }
     template<typename T> MATH_BITS_ALWAYS_INLINE inline void vstore(T& r, T v)     { *static_cast<volatile T*>(&r) = v; }
+
+    // Full 32x32 -> 64-bit product. With MATH_BITS_SPLIT_MUL64 from 16x16 partial products (inline,
+    // instead of a call to __aeabi_lmul on cores without a widening multiply), else plain uint64_t.
+    MATH_BITS_ALWAYS_INLINE constexpr uint64_t mul32_wide(uint32_t x, uint32_t m)
+    {
+#if MATH_BITS_SPLIT_MUL64
+        const uint32_t xl = x & 0xFFFFu, xh = x >> 16, ml = m & 0xFFFFu, mh = m >> 16;
+        const uint32_t ll = xl * ml, lh = xl * mh, hl = xh * ml;
+        const uint32_t mid = (ll >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu);   // <= 3*0xFFFF, no overflow
+        const uint32_t hi = xh * mh + (lh >> 16) + (hl >> 16) + (mid >> 16);
+        return (static_cast<uint64_t>(hi) << 32) | ((mid << 16) | (ll & 0xFFFFu));
+#else
+        return static_cast<uint64_t>(x) * m;
+#endif
+    }
 }
 
 template<auto max_input_value, typename IoType = uint32_t, typename CalcType = uint32_t,
@@ -1637,6 +1659,13 @@ public:
     static_assert(den_min >= 1 && den_min <= den_max, "gain contract: need 1 <= den_min <= den_max (set num_min/num_max/den_min/den_max in the options)");
     static_assert(num_max >= 1 && num_min <= num_max, "gain contract: need num_min <= num_max and num_max >= 1");
     static_assert(Options::gain_min.den >= 1 && Options::gain_max.den >= 1, "gain_min / gain_max: den must not be 0");
+    static constexpr bool has_output_limit = Options::output_limit != ~uint64_t{0};
+    static constexpr bool clamp_output     = Options::clamp_output;
+    static_assert(!clamp_output || has_output_limit, "Options::clamp_output needs Options::output_limit");
+    static_assert(!has_output_limit || Options::output_limit <= static_cast<uint64_t>(std::numeric_limits<out_type>::max()),
+                  "Options::output_limit does not fit in out_type!");
+    static constexpr out_type output_limit = has_output_limit ? static_cast<out_type>(Options::output_limit)
+                                                              : std::numeric_limits<out_type>::max();
 
 private:
     using u128 = math_bits_detail::u128;
@@ -1661,29 +1690,43 @@ public:
     static constexpr math_bits_ratio gain_hi = gain_max_restricts ? Options::gain_max : math_bits_ratio{ num_max, den_min };
     static_assert(cmp_ratio(gain_lo.num, gain_lo.den, gain_hi.num, gain_hi.den) <= 0, "gain_min/gain_max leave no gain the num/den contract allows");
 
+    // Fixed denominator (den_min == den_max): the gain is num / den_min with only num set at runtime
+    // (set(num), prepare(num), evaluate(num) and a one-argument constructor; the two-argument forms
+    // still work). The error bound then uses the residue of that one denominator, and the multiplier
+    // is computed without a runtime division (see compute_m).
+    static constexpr bool fixed_den = den_min == den_max;
+
     // ---- Error guarantee, proven for every gain the contract allows ----
-    // The multiplier is rounded up, M = ceil(num * 2^s / den), so M*den - num*2^s is in [0, den-1]
-    // and mult(x) = floor(x*num/den + x*e) with 0 <= x*e <= x*(den-1)/(den*2^s). The fractional part
-    // of x*num/den is at most (den-1)/den, so the error stays in [0, k] for k = max_error when
-    //   truncating:  max_input * (den-1)     < (k*den + 1) * 2^s
-    //   rounding:    2*max_input * (den-1)   < (2k*den + 1) * 2^s   (steps of 1/(2den))
-    // Linear in den, so it holds for all allowed denominators when it holds at the extremes:
-    // den_min, den_max and the denominators of clamping limits.
-    static constexpr bool error_proven_for(uint64_t den, int s)
+    // The multiplier is rounded up, M = ceil(num * 2^s / den), so rho = M*den - num*2^s is in
+    // [0, den-1] and mult(x) = floor(x*num/den + x*e) with 0 <= x*e = x*rho/(den*2^s). The fractional
+    // part of x*num/den is at most (den-1)/den, so the error stays in [0, k] for k = max_error when
+    //   truncating:  max_input * rho_max     < (k*den + 1) * 2^s
+    //   rounding:    2*max_input * rho_max   < (2k*den + 1) * 2^s   (steps of 1/(2den))
+    // Over a range of denominators rho_max = den-1: linear in den, so the bound holds for all allowed
+    // denominators when it holds at the extremes, den_min and den_max. For a single denominator (a
+    // fixed den, or a clamping limit) rho_max = den - gcd(den, 2^s), since rho is a multiple of that
+    // gcd: the same for an odd den, exact (rho = 0) for a power of two up to 2^s.
+    static constexpr uint64_t rho_max(uint64_t den, int s, bool single)
+    {
+        if (!single) return den - 1;
+        const int tz = std::countr_zero(den);
+        return den - (uint64_t{1} << (tz < s ? tz : s));
+    }
+    static constexpr bool error_proven_for(uint64_t den, int s, bool single)
     {
         if (den <= 1) return true;                                        // integer gain: exact
         constexpr int r = trade_speed_for_precision ? 1 : 0;
         if (s < r) return false;
-        const u128 W = math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), den - 1) >> (s - r);
+        const u128 W = math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), rho_max(den, s, single)) >> (s - r);
         const u128 kd = math_bits_detail::mul64(Options::max_error, den);
         if (r && (kd.hi >> 63)) return true;                              // right side >= 2^128 > W
         return W < (r ? (kd << 1) : kd) + u128(1);                        // floor(lhs / 2^s) < k*den + 1
     }
     static constexpr bool error_proven_at(int s)
     {
-        return error_proven_for(den_min, s) && error_proven_for(den_max, s)
-            && (!clamp_gain || !gain_min_restricts || error_proven_for(Options::gain_min.den, s))
-            && (!clamp_gain || !gain_max_restricts || error_proven_for(Options::gain_max.den, s));
+        return error_proven_for(den_min, s, fixed_den) && error_proven_for(den_max, s, fixed_den)
+            && (!clamp_gain || !gain_min_restricts || error_proven_for(Options::gain_min.den, s, true))
+            && (!clamp_gain || !gain_max_restricts || error_proven_for(Options::gain_max.den, s, true));
     }
 
     // The shift: the largest s < digits(calc_type) with max_input * ceil(gain_hi * 2^s) <= max(calc_type).
@@ -1818,6 +1861,24 @@ public:
         }
     }
 
+    // ---- Output limit (Options::output_limit, clamp_output) ----
+    // The largest result within the contract: mult() grows with x and with the multiplier, so it is
+    // mult(max_input) at the largest multiplier.
+    static constexpr out_type max_output_int = mult_with(max_input_int, static_cast<m_type>(mult_factor_int_max));
+    static constexpr bool output_limited = has_output_limit && max_output_int > output_limit;
+    static_assert(clamp_output || !output_limited,
+                  "max_input_value * largest gain can exceed Options::output_limit: lower gain_max (clamp_gain) or "
+                  "max_input_value, or set clamp_output to saturate");
+    // The saturation is dropped when it provably changes no result: the limit is not reached within
+    // the contract and clamp_input keeps every input within it. (Without clamp_input, an input above
+    // max_input_value can give anything, also a wrapped product, so it stays.)
+    static constexpr bool saturate_output = clamp_output && (output_limited || !clamp_input);
+    MATH_BITS_ALWAYS_INLINE static constexpr out_type saturate(out_type out)
+    {
+        if constexpr (saturate_output) return out > output_limit ? output_limit : out;
+        else                           return out;
+    }
+
     // ---- Gain evaluation (pure; used by set / prepare and the compile-time self-test) ----
     struct evaluation
     {
@@ -1828,6 +1889,9 @@ public:
     // Multipliers of the gain limits, used when clamping (0 when a limit does not restrict).
     static constexpr m_type M_gain_min = gain_min_restricts ? static_cast<m_type>(ceil_scaled(Options::gain_min, bitShifts).lo) : m_type(0);
     static constexpr m_type M_gain_max = gain_max_restricts ? static_cast<m_type>(ceil_scaled(Options::gain_max, bitShifts).lo) : m_type(0);
+
+    // Fixed denominator only: the gain num / den_min.
+    static constexpr evaluation evaluate(uint64_t num) requires fixed_den { return evaluate(num, den_min); }
 
     static constexpr evaluation evaluate(uint64_t num, uint64_t den)
     {
@@ -1843,12 +1907,75 @@ public:
         return { status::ok, compute_m(num, den), num, den };
     }
 
-    // M = ceil(num * 2^s / den) for a gain within the contract: one 64-bit division when num * 2^s
-    // fits 64 bits (decided at compile time from num_max), else a 128-by-64-bit division.
+    // Fixed denominator D = den_min: M without a runtime division. With 2^s = q0*D + r0 (compile time),
+    //   M = ceil(num * 2^s / D) = num*q0 + ceil(num*r0 / D),
+    // and ceil(num*r0 / D) = floor(y / D) for y = num*r0 + D-1. That is a division by a constant over
+    // the small range y <= y_max: floor(y * m / 2^t) with m = ceil(2^t / D), exact for every
+    // y <= y_max when y_max * (m*D - 2^t) < 2^t (the 1/D argument above, with k = 0). The smallest
+    // such t is taken. Applies when num_max, y_max and m are below 2^32 (one 32x32 -> 64 multiply);
+    // otherwise, or with a range of denominators, compute_m divides.
+    struct fixed_den_plan
+    {
+        bool     applies;
+        uint64_t q0, r0;       // 2^s = q0 * D + r0
+        bool     narrow;       // num * q0 fits 32 bits for every num <= num_max
+        uint32_t m;            // ceil(2^t / D) (unused when r0 == 0: nothing to divide)
+        int      t;
+    };
+    static constexpr fixed_den_plan calc_fixed_den_plan()
+    {
+        fixed_den_plan p{ false, 0, 0, false, 0, 0 };
+        if (!fixed_den || (num_max >> 32) != 0) return p;
+        constexpr uint64_t D = den_min;
+        p.q0 = (uint64_t{1} << bitShifts) / D;
+        p.r0 = (uint64_t{1} << bitShifts) % D;
+        const u128 nq = math_bits_detail::mul64(num_max, p.q0);
+        if (nq.hi != 0) return p;
+        p.narrow = (nq.lo >> 32) == 0;
+        if (p.r0 != 0)
+        {
+            const u128 y_max = math_bits_detail::mul64(num_max, p.r0) + u128(D - 1);
+            if (y_max.hi != 0 || (y_max.lo >> 32) != 0) return p;
+            for (int t = 0; t < 64; ++t)
+            {
+                const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(u128(1) << t, D);
+                const u128 m = qr.rem ? qr.quot + u128(1) : qr.quot;
+                if (m.hi != 0 || (m.lo >> 32) != 0) return p;               // m only grows with t
+                const uint64_t rho = qr.rem ? D - qr.rem : 0;               // m*D - 2^t
+                if (math_bits_detail::mul64(y_max.lo, rho) < (u128(1) << t))
+                {
+                    p.m = static_cast<uint32_t>(m.lo);
+                    p.t = t;
+                    break;
+                }
+            }
+            if (p.m == 0) return p;
+        }
+        p.applies = true;
+        return p;
+    }
+    static constexpr fixed_den_plan fixed_plan = calc_fixed_den_plan();
+
+    // M = ceil(num * 2^s / den) for a gain within the contract: without a division for a fixed
+    // denominator (fixed_den_plan), else one 64-bit division when num * 2^s fits 64 bits (decided at
+    // compile time from num_max), else a 128-by-64-bit division.
     static constexpr m_type compute_m(uint64_t num, uint64_t den)
     {
         constexpr int s = bitShifts;
-        if constexpr (s == 0 || (num_max >> (64 - s)) == 0)
+        if constexpr (fixed_plan.applies)
+        {
+            constexpr fixed_den_plan p = fixed_plan;
+            (void)den;                                                      // == den_min (contract)
+            const m_type a = p.narrow ? static_cast<m_type>(static_cast<uint32_t>(num) * static_cast<uint32_t>(p.q0))
+                                      : static_cast<m_type>(num * p.q0);
+            if constexpr (p.r0 == 0) return a;
+            else
+            {
+                const uint32_t y = static_cast<uint32_t>(num) * static_cast<uint32_t>(p.r0) + static_cast<uint32_t>(den_min - 1);
+                return static_cast<m_type>(a + static_cast<m_type>(math_bits_detail::mul32_wide(y, p.m) >> p.t));
+            }
+        }
+        else if constexpr (s == 0 || (num_max >> (64 - s)) == 0)
         {
             const uint64_t a = num << s;
             return static_cast<m_type>(a / den + (a % den != 0 ? 1u : 0u));
@@ -1936,13 +2063,15 @@ public:
         if constexpr (use_seq) { st.slot[0] = m; st.slot[1] = m; st.seq = 0; }
         else                   st.active = m;
     }
+    // Fixed denominator only: initial gain num / den_min.
+    constexpr explicit mult_bitshift_ratio_dyn(uint64_t num) requires fixed_den : mult_bitshift_ratio_dyn(num, den_min) {}
 
-    // Multiply by the active gain.
+    // Multiply by the active gain (saturated to output_limit with clamp_output).
     MATH_BITS_ALWAYS_INLINE out_type mult(io_type input_val) const
     {
         if constexpr (clamp_input)
             if (input_val > max_input_int) input_val = max_input_int;
-        return mult_with(input_val, active_multiplier());
+        return saturate(mult_with(input_val, active_multiplier()));
     }
     MATH_BITS_ALWAYS_INLINE out_type operator*(io_type val) const { return mult(val); }
     MATH_BITS_ALWAYS_INLINE friend out_type operator*(io_type val, const mult_bitshift_ratio_dyn& rhs) { return rhs.mult(val); }
@@ -1954,6 +2083,8 @@ public:
         if (e.result != status::rejected) publish(e.m);
         return e.result;
     }
+    // Fixed denominator only: set the gain num / den_min.
+    status set(uint64_t num) requires fixed_den { return set(num, den_min); }
 
     // Two-phase change: prepare() evaluates and keeps the new gain pending (the active gain is
     // unchanged); apply_new() makes the pending gain active. Returns false if nothing is pending.
@@ -1968,6 +2099,7 @@ public:
         }
         return e.result;
     }
+    status prepare(uint64_t num) requires fixed_den { return prepare(num, den_min); }
     bool apply_new()
     {
         m_type m;
@@ -1996,7 +2128,8 @@ private:
             const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(math_bits_detail::mul64(x, e.num), e.den);
             uint64_t ref = qr.quot.lo;
             if (trade_speed_for_precision && qr.rem >= e.den - qr.rem) ++ref;
-            const uint64_t out = static_cast<uint64_t>(mult_with(static_cast<io_type>(x), e.m));
+            const uint64_t out = static_cast<uint64_t>(saturate(mult_with(static_cast<io_type>(x), e.m)));
+            if (saturate_output && ref > Options::output_limit) ref = Options::output_limit;   // min(exact, limit)
             return out >= ref && out - ref <= Options::max_error;
         };
         for (uint64_t i = 0; i < n && i <= mi; ++i)
@@ -2012,6 +2145,27 @@ private:
             && gain_ok(mid_num, mid_den) && gain_ok(mid_num, den_max) && gain_ok(num_max, mid_den);
     }
     static_assert(calc_self_test(), "mult_bitshift_ratio_dyn self-test failed (implementation error)");
+
+    // Fixed denominator: the division-free compute_m against the exact ceil(num * 2^s / D), for every
+    // num of the contract up to the largest gain (evenly sampled beyond 4096 values, 65536 with deep_test).
+    static constexpr bool calc_fixed_den_test()
+    {
+        if constexpr (!fixed_plan.applies) return true;
+        else
+        {
+            constexpr uint64_t D = den_min, n = deep_test ? 65536 : 4096;
+            constexpr uint64_t step = (num_max - num_min) / n + 1;
+            auto ok = [](uint64_t num)
+            {
+                if (cmp_ratio(num, D, gain_hi.num, gain_hi.den) > 0) return true;   // never computed
+                return compute_m(num, D) == static_cast<m_type>(ceil_scaled(math_bits_ratio{ num, D }, bitShifts).lo);
+            };
+            for (uint64_t num = num_min; num_max - num >= step; num += step)
+                if (!ok(num)) return false;
+            return ok(num_max);
+        }
+    }
+    static_assert(calc_fixed_den_test(), "mult_bitshift_ratio_dyn fixed-denominator multiplier self-test failed (implementation error)");
 };
 
 // D1 regression — locks in the invariant that the clamp boundary is monotonic
