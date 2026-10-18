@@ -16,7 +16,7 @@ On-target tests for `math_bits.h`, used to verify `mult_bitshift_ratio_dyn` on a
 
 **`math_bits_hwtest.inc`**: `r[DONE]` becomes 1 when finished; the run time per stress scenario is `stress_ms` (20 s; 300 s for a soak). It uses TIM6 and TIM7 and defines their interrupt handlers (`TIM6_DAC_LPTIM1_IRQHandler`, `TIM7_LPTIM2_IRQHandler`), so the project must not use them, and `HAL_GetTick()` for timing.
 
-- **Functional:** static double and ratio scalers against the target's own soft-float or exact integer reference; runtime gains (32-bit and 64-bit multiplier, rounding, `MPSC`, clamping, random gains) against exact `x·num/den`, including `set()` status codes.
+- **Functional:** static double and ratio scalers against the target's own soft-float or exact integer reference; runtime gains (32-bit and 64-bit multiplier, rounding, `MPSC`, clamping, random gains) against exact `x·num/den`, including `set()` status codes; input and output clamping (`clamp_input`, `clamp_output`, cfg 26–28) and the fixed denominator (`set(num)`, cfg 29–30) over the whole `io_type` range, also above `max_input_value`.
 - **Stress:** a jittered writer interrupt (TIM6, priority 2) and reader interrupt (TIM7, priority 1) change the gain and call `mult()` while main does the other side. The writer toggles between two gains; every output must equal the exact result of one of them (a torn multiplier gives neither). This covers both directions, 64-bit and 32-bit multipliers, two writers, and `prepare()` + `apply_new()`.
 - **Negative control:** scenarios 0 and 1 run the same race on an unprotected 64-bit variable. They must show torn reads; zero would mean the test cannot detect tearing.
 
@@ -32,8 +32,9 @@ On-target tests for `math_bits.h`, used to verify `mult_bitshift_ratio_dyn` on a
 | `-Os`, 20 s per scenario | ≈ 17.9 M | 0 | 7,265 / 29,416 |
 | `-Os`, 300 s per scenario | ≈ 268 M | 0 | 109,571 / 437,792 |
 | `-O0`, 300 s per scenario | ≈ 162 M | 0 | 318,517 / 1,458,399 |
+| `-Os`, 20 s per scenario, 2026-10-18 (with clamp and fixed-denominator checks) | ≈ 16.7 M | 0 | 7,402 / 24,083 |
 
-Functional part, every run: 115,840 output checks and 1,800 status checks, 0 failures.
+Functional part, every run: 115,840 output checks and 1,800 status checks, 0 failures. Since 2026-10-18 (cfg 26–30 added): 155,840 output checks and 2,300 status checks, 0 failures.
 
 **Benchmark**, net cycles per call at `-Os`; average (min–max) where the cost depends on the input:
 
@@ -43,4 +44,6 @@ Functional part, every run: 115,840 output checks and 1,800 status checks, 0 fai
 | 12-bit ADC → mV, exact | 7 (u32 calc) | 21 (u64 calc) | | |
 | 24-bit µs → ms (1/1000), exact | 47 | 47 (`None`), 74 (`SPSC`) | 122 (37–134) | 662 (203–704) |
 
-Runtime gain changes: `set()` ≈ 750–790 cycles (≈ 12 µs, mostly `__aeabi_uldivmod`), `prepare()` ≈ 830, `apply_new()` 43. At `-O0`: `mult()` 34 (static ADC) to 188 cycles (`SPSC` timer), `set()` ≈ 1,800.
+Runtime gain changes: `set()` ≈ 750–790 cycles (≈ 12 µs, mostly `__aeabi_uldivmod`), `prepare()` ≈ 830, `apply_new()` 43.
+
+**Benchmark 2026-10-18** (same board and clock, `-Os`, image built from the project's startup/HAL with the bench as `main_cpp()`; 0 mismatches): fixed denominator `num/4095`, `set(num)` without a division: **60 cycles** (`max_error 1`, `u32` calc) and **64 cycles** (exact, `u64` calc), constant over all inputs — versus 747 / 777 (avg) for `set(num, den)` with a range of denominators in the same run. `mult()` of the fixed-denominator exact scaler: 23 cycles, the same as the runtime gain with a denominator range (`dA0`). The `mult()` figures of this build are 0–2 cycles above the 2026-10-11 table (static ADC 9, runtime 12 / 23, timer 49 / 76 / 49); code layout differs between the two builds. At `-O0`: `mult()` 34 (static ADC) to 188 cycles (`SPSC` timer), `set()` ≈ 1,800.

@@ -147,6 +147,66 @@ template<class T> void check_dyn(uint32_t id, T& obj)
     }
 }
 
+// Input and output clamping, and the fixed denominator (set(num)). Gains within the contract,
+// inputs over the whole io_type range, also above max_input_value. Reference: the input clamped to
+// max_input_value (clamp_input), exact x*num/den, saturated to output_limit (clamp_output). Without
+// clamp_input an input above max_input_value has no reference; then only "never above
+// output_limit" is checked (clamp_output). With clamp_input it must equal mult(max_input_value).
+struct cin   : adc32 { static constexpr bool clamp_input = true; };
+struct cout  : adc32 { static constexpr uint64_t output_limit = 3300; static constexpr bool clamp_output = true; };
+struct cboth : adcr  { static constexpr uint64_t output_limit = 3300; static constexpr bool clamp_output = true, clamp_input = true; };
+struct cfix0 : adc64 { static constexpr uint64_t den_min = 4095, den_max = 4095; };
+struct cfix  : cfix0 { static constexpr uint64_t output_limit = 3200; static constexpr bool clamp_output = true; };
+using CIN = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, cin>;
+using COU = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, cout>;
+using CBO = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, cboth>;
+using CF0 = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, cfix0>;
+using CFX = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, cfix>;
+constinit CIN cin_o{ 3300, 4095 };
+constinit COU cou_o{ 3300, 4095 };
+constinit CBO cbo_o{ 3300, 4095 };
+constinit CF0 cf0_o{ 3300 };
+constinit CFX cfx_o{ 3300 };
+
+template<class T> void check_clamp(uint32_t id, T& obj)
+{
+    using O = typename T::options;
+    using io = typename T::io_type;
+    const uint64_t mi = (uint64_t)T::max_input_int, io_max = (uint64_t)std::numeric_limits<io>::max();
+    for (int g = 0; g < 100; ++g)
+    {
+        const uint64_t num = O::num_min + xs32(rng_main) % (O::num_max - O::num_min + 1);
+        const uint64_t den = O::den_min + xs32(rng_main) % (O::den_max - O::den_min + 1);
+        typename T::status st;
+        if constexpr (T::fixed_den) st = obj.set(num); else st = obj.set(num, den);
+        ++r[SCHK];
+        if (st != T::status::ok)
+        {
+            if (r[SFAIL]++ == 0) { r[SF_ID] = id; r[SF_GOT] = (uint32_t)st; r[SF_EXP] = (uint32_t)T::status::ok; }
+            continue;
+        }
+        const uint64_t top = (uint64_t)obj.mult((io)mi);
+        for (int i = 0; i < 80; ++i)
+        {
+            // around max_input_value, the top of io_type, then random over the whole io_type range
+            const uint64_t x = i < 20 ? mi - 10 + (uint64_t)i : (i < 30 ? io_max - (uint64_t)(i - 20) : xs32(rng_main) % (io_max + 1));
+            const uint64_t out = (uint64_t)obj.mult((io)x);
+            ++r[FCHK];
+            if (O::clamp_output && out > O::output_limit) { ffail(id, x, out, O::output_limit, 0xFFFFFFFFu); continue; }
+            if (x > mi)
+            {
+                if (O::clamp_input && out != top) ffail(id, x, out, top, 0xFFFFFFFEu);
+                if (!O::clamp_input) continue;
+            }
+            const uint64_t xc = x > mi ? mi : x;
+            uint64_t ref = (xc * num) / den;
+            if (T::trade_speed_for_precision && 2 * ((xc * num) % den) >= den) ++ref;
+            if (O::clamp_output && ref > O::output_limit) ref = O::output_limit;
+            if (out < ref || out - ref > (uint64_t)O::max_error) ffail(id, x, out, ref, (uint32_t)(num << 16 | (den & 0xFFFF)));
+        }
+    }
+}
+
 void phase_dyn()
 {
     check_dyn(20, a32);
@@ -155,6 +215,11 @@ void phase_dyn()
     check_dyn(23, tk);
     check_dyn(24, tkm);
     check_dyn(25, cl);
+    check_clamp(26, cin_o);
+    check_clamp(27, cou_o);
+    check_clamp(28, cbo_o);
+    check_clamp(29, cf0_o);
+    check_clamp(30, cfx_o);
 }
 
 // ---------------- Phase 3: concurrency stress ----------------
