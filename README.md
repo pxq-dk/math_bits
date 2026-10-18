@@ -48,7 +48,7 @@ uint16_t result = scale75::mult(800);  // result ≈ 600
 When the factor is really a fraction — downsampling by 3, ticks at 48 kHz to milliseconds, ADC counts to millivolts — give it as an exact ratio `P/Q` instead of a double:
 
 ```cpp
-struct exact : mult_bitshift_options { static constexpr uint64_t max_error = 0; };
+struct exact : mult_bitshift_ratio_options { static constexpr uint64_t max_error = 0; };
 
 // 48 kHz ticks -> ms over the full 32-bit range: exactly ticks * 1000 / 48000, proven for every input
 using ticks_to_ms = mult_bitshift_ratio<1000, 48000, 0xFFFFFFFFu, uint32_t, uint64_t, exact>;
@@ -60,11 +60,21 @@ using adc_to_mv   = mult_bitshift_ratio<3300, 4095, 4095u, uint16_t, uint32_t, e
 using times_0_7   = mult_bitshift_ratio<7, 10, 1000000u, uint32_t, uint64_t, exact>;
 ```
 
-`mult_bitshift_ratio<P, Q, max_input_value, io_type, calc_type, Options>` is an alias for `mult_bitshift<math_bits_ratio{P, Q}, …>`; everything else (options, `mult()`, generated code) is the same as for a floating-point `multvalue`. Differences:
+`mult_bitshift_ratio<P, Q, max_input_value, io_type, calc_type, Options>` is an alias for `mult_bitshift<math_bits_ratio{P, Q}, …>`; `mult()` and the generated code are the same as for a floating-point `multvalue`. Differences:
 
-- **Reference:** `mult()` is checked against the exact integer result `⌊x·P/Q⌋` (with `trade_speed_for_precision`: `⌊x·P/Q + ½⌋`) — no floating-point expression and none of its quirks.
+- **Options:** derive from `mult_bitshift_ratio_options` (the default), not `mult_bitshift_options`. They have the same members (`max_error`, `deep_test`, `clamp_input`, `min_output_range`, `out_type`), except that the rounding is selected with `rounding` instead of `trade_speed_for_precision`:
+
+  | `rounding` | `mult()` targets |
+  |---|---|
+  | `math_bits_rounding::floor` (default) | `⌊x·P/Q⌋` |
+  | `math_bits_rounding::nearest` | `⌊x·P/Q + ½⌋` — to nearest, ties up; same implementation and cost as `trade_speed_for_precision` |
+  | `math_bits_rounding::ceiling` | `⌈x·P/Q⌉` — never above it, at most `max_error` below (see *Rounding up* below) |
+
+  The build fails with a message when the options derive from the other struct, or when a derived struct sets the other form's member (which would otherwise be silently ignored).
+- **Reference:** `mult()` is checked against the exact integer result `⌊x·P/Q⌋` (with `rounding = nearest`: `⌊x·P/Q + ½⌋`, with `ceiling`: `⌈x·P/Q⌉`) — no floating-point expression and none of its quirks.
 - **Exactness proof:** `x·P/Q` only has fractional parts in steps of `1/Q`, so a multiplier that runs high by less than one step can never reach the next integer: if `0 ≤ max_input_value · e < 1/Q` (`1/(2Q)` when rounding), `mult()` equals the reference for **every** input, proven without testing (the classic division-by-a-constant argument). Where the nearest multiplier would run low, the multiplier selection picks the rounded-up one. `max_error = 0` is then free.
 - **Exact check where the proof does not reach:** the error at `x` depends only on the residue `x·P mod Q` and grows with `x`, so per residue the worst input is the largest one with that residue, and only residues close enough to the next integer can fail at all. The self-test checks exactly those inputs (found with the inverse of `P` mod `Q`), which verifies every input up to `max_input_value` without sampling. It is used when at most 65536 residues qualify — always the case for denominators up to about 10⁵ such as 48000, 4095 or 1000; beyond that (e.g. `Q` around 10⁹ with a large error) the sampled check of a floating-point `multvalue` is used, with its sampling limit for `max_error = 0`.
+- **Rounding up** (`rounding = ceiling`): the multiplier is rounded down, `M = ⌊P·2^s/Q⌋` (a multiplier above `P/Q` would put every exact result 1 LSB too high). Below `P/Q`, `mult(x) = ⌊x·M/2^s⌋ + (x ≠ 0)`: no bias and no low bits of the product, and never below `⌈x·M/2^s⌉`. When `P·2^s/Q` is an integer (`Q` a power of two), `M` is exact and `mult(x) = ⌈x·M/2^s⌉`, by the bias `2^s − 1` (or, without room for it, `(v >> s) + (low bits ≠ 0)`), exact for every input. `ceil_xnz` shows which form is used. The proof and the exact check are the mirror images of the ones above: `mult()` equals `⌈x·P/Q⌉` for every input if `max_input_value · |e| ≤ 1/Q` (`e < 0`), and the residue check runs on `(−x·P) mod Q`. No other multiplier is tried. `out_type` needs no headroom for `max_error`, since `mult()` never exceeds `⌈max_input_value · P/Q⌉`. Checked against the exact worst error of 800 random ratios (including powers of two): `max_error` = the true worst error builds, one less fails, for every one of them. (`test/host/ceil_verdict_test.py`; `test/host/math_bits_ceil_test.cpp` checks every residue class at runtime.) Cost on an STM32G071 (`-Os`, cycles per call, floor → ceiling): 12-bit ADC `3300/4095`, `uint32_t` calc 6 → 14 (4 instructions more; the rest is code placement with 2 flash wait states), 24-bit timer `1/1000`, `uint64_t` calc 47 → 49; plain C `(x·P + Q − 1) / Q` 114–127.
 - `P/Q` is reduced (`1000/48000` → `1/48`); it must not reduce to an integer (integer multiplication is not supported — the compiler already does it optimally), and `P`, `Q` must not be 0.
 - `mult_factor` is only an informational `long double` approximation of `P/Q`; `is_ratio` is `true`.
 
@@ -91,7 +101,7 @@ if (adc.set(cal_num, cal_den) == adc_scale::status::rejected) { /* old gain stil
 // or two-phase: adc.prepare(n, d) computes and checks (old gain stays active), adc.apply_new() switches
 ```
 
-`mult_bitshift_ratio_dyn<max_input_value, io_type, calc_type, Options>`; the options derive from `mult_bitshift_ratio_dyn_options`, which has everything from `mult_bitshift_options` (`max_error`, `trade_speed_for_precision`, `clamp_input`, `out_type`, …). Here `clamp_input` clamps the input itself: an input above `max_input_value` gives `mult(max_input_value)` at the active gain (there is no fixed `max_output_int`, since the largest result depends on the gain). Added options:
+`mult_bitshift_ratio_dyn<max_input_value, io_type, calc_type, Options>`; the options derive from `mult_bitshift_ratio_dyn_options`, which has everything from `mult_bitshift_ratio_options` (`max_error`, `rounding`, `clamp_input`, `out_type`, …; checked at compile time). Here `clamp_input` clamps the input itself: an input above `max_input_value` gives `mult(max_input_value)` at the active gain (there is no fixed `max_output_int`, since the largest result depends on the gain). Added options:
 
 | Member | Default | Description |
 |---|---|---|
@@ -101,7 +111,14 @@ if (adc.set(cal_num, cal_den) == adc_scale::status::rejected) { /* old gain stil
 | `output_limit`, `clamp_output` | no limit, `false` | Limit for the result (e.g. DAC full scale; must fit `out_type`). Without `clamp_output`: compile-time check only — build error if `max_input_value` × any allowed gain can exceed it. With `clamp_output`: `mult()` saturates (`min(result, output_limit)`, about 6 instructions on Cortex-M0+) for every input, also above `max_input_value`; the error guarantee holds against `min(exact, output_limit)`. The saturation is dropped when the limit is unreachable and `clamp_input` is set. |
 | `topology` | `math_bits_topology::None<>` | Concurrency, with the names and members of RingBuffer_Cortex's `Topology` (whose types can be passed directly): producer = the context changing the gain, consumer = the context calling `mult()`. `None`, `SPSC`, `MPSC`, `SPMC`, `MPMC`, each with a lock type (default: PRIMASK, by inline assembly — no CMSIS needed). |
 
-**What is proven at compile time** (for every gain the contract and the gain range allow): `max_input_value × largest gain` fits `calc_type` and `out_type`, and every result is within `max_error` of the exact `⌊x·num/den⌋` (`⌊x·num/den + ½⌋` when rounding). The multiplier is rounded up, `M = ⌈num·2^s/den⌉`, so the error is never negative, and with the fractional parts of `x·num/den` in steps of `1/den` the guarantee follows from one inequality per denominator, `max_input · ρ < (max_error · den + 1) · 2^s` (`2·max_input·ρ < (2·max_error·den + 1)·2^s` when rounding), where `ρ = M·den − num·2^s` is the rounding residue of the multiplier. Over a range of denominators `ρ ≤ den − 1` — linear in `den`, so checking `den_min`, `den_max` covers all. For a single denominator (a fixed one, or a clamping limit) `ρ ≤ den − gcd(den, 2^s)`, since `ρ` is a multiple of that gcd: the same for an odd `den`, and `ρ = 0` (exact for any input range) for a power of two. Nothing is checked per gain at runtime except the contract. `max_error = 0` needs `2^s > max_input · (den_max − 1)`: e.g. a 12-bit ADC with `den_max = 4095` needs a 64-bit `calc_type`; with `uint32_t` `den_max` up to about 256 works. If it cannot be proven, the build fails and says what to change.
+**What is proven at compile time** (for every gain the contract and the gain range allow): `max_input_value × largest gain` fits `calc_type` and `out_type`, and every result is within `max_error` of the exact `⌊x·num/den⌋` (`⌊x·num/den + ½⌋` when rounding to nearest; for ceiling see *Rounding up* below). The multiplier is rounded up, `M = ⌈num·2^s/den⌉`, so the error is never negative, and with the fractional parts of `x·num/den` in steps of `1/den` the guarantee follows from one inequality per denominator, `max_input · ρ < (max_error · den + 1) · 2^s` (`2·max_input·ρ < (2·max_error·den + 1)·2^s` when rounding), where `ρ = M·den − num·2^s` is the rounding residue of the multiplier. Over a range of denominators `ρ ≤ den − 1` — linear in `den`, so checking `den_min`, `den_max` covers all. For a single denominator (a fixed one, or a clamping limit) `ρ ≤ den − gcd(den, 2^s)`, since `ρ` is a multiple of that gcd: the same for an odd `den`, and `ρ = 0` (exact for any input range) for a power of two. Nothing is checked per gain at runtime except the contract. `max_error = 0` needs `2^s > max_input · (den_max − 1)`: e.g. a 12-bit ADC with `den_max = 4095` needs a 64-bit `calc_type`; with `uint32_t` `den_max` up to about 256 works. If it cannot be proven, the build fails and says what to change.
+
+**Rounding up** (`rounding = math_bits_rounding::ceiling`): `mult()` targets `⌈x·num/den⌉` and is never above it, at most `max_error` below. A multiplier rounded up, as above, would put every exact result (`x·num/den` an integer) 1 LSB too high, so ceiling rounds it the other way, and the guarantee is the mirror image of the one above, with the same `max_error` for the same contract:
+
+- **Form 1** (used when it can be proven): `M = ⌈num·2^s/den⌉ − 1`, strictly below the exact value, and `mult(x) = ⌊x·M/2^s⌋ + (x ≠ 0)`. There is no bias, and the low bits of the product are not needed: 3–4 instructions over floor. Its bound, `max_input · den ≤ (max_error · den + 1) · 2^s`, is marginally stronger than the floor bound (residue up to `den` instead of `den − 1`). It needs every gain the contract and the gain range allow to be above 0, since `x = 0` must give 0.
+- **Form 2** (otherwise: a contract that allows gain 0, or a power-of-two denominator that is only exact this way): `M = ⌊num·2^s/den⌋` with the bias `2^s − 1`, `mult(x) = ⌈x·M/2^s⌉`, under the same inequality as floor (`ρ = num·2^s − M·den`, the same bounds). When the bias does not fit next to the largest product, `(v >> s) + (low bits ≠ 0)` gives the same result without room.
+
+Both are proven at compile time like the other modes; the class picks form 1 when its bound holds (`ceil_xnz`). `set()` computes `M` exactly as before (form 1: minus 1; form 2: no remainder test), also without a division for a fixed denominator. `out_type` needs no headroom for `max_error`, since `mult()` never exceeds `⌈max_input · gain_hi⌉`. Cost on an STM32G071 at 64 MHz (`-Os`, cycles per `mult()`, floor → ceiling): 12-bit ADC with `uint32_t` calc 8 → 13, with `uint64_t` calc and a 32-bit multiplier 19 → 25 (fixed denominator 19 → 24), 24-bit input with a 64-bit multiplier 46 → 49; `set()` unchanged within a few cycles. Plain C `(x·num + den − 1) / den` takes 114–127 cycles on average. Host test (exhaustive or worst-case inputs over many gains, both multiply paths): `test/host/math_bits_ceil_test.cpp`.
 
 | Function | Description |
 |---|---|
@@ -112,6 +129,7 @@ if (adc.set(cal_num, cal_den) == adc_scale::status::rejected) { /* old gain stil
 | `set(num)`, `prepare(num)`, `evaluate(num)`, constructor `(num)` | Fixed denominator only: the same with `den = den_min`. |
 | `active_multiplier()` | The integer multiplier in use (for inspection). |
 | `bitShifts`, `mult_factor_int_max`, `gain_lo`, `gain_hi`, `m_type` | Compile-time constants: the shift, the largest multiplier, the gain range, the multiplier type. |
+| `rounding`, `ceil_xnz` | The rounding mode; with ceiling, whether form 1 is used (see *Rounding up*). |
 
 **Concurrency:** `mult()` never takes a lock. A multiplier of up to 32 bits is one word, read and written atomically; a 64-bit one is kept in a double buffer with a sequence counter — the writer fills the slot readers are not using and then publishes with one atomic store; the reader re-reads if the gain changed while it read. So `SPSC` is safe in both directions (ISR writing and main reading, or the reverse). The lock (`MPSC`/`MPMC`) only serializes several producers, around the store — not around the division that computes the multiplier. The shift is chosen so the multiplier fits 32 bits whenever the error guarantee still holds there. Written for single-core Cortex-M (ordering by `volatile` accesses).
 
@@ -144,7 +162,7 @@ uint16_t result = scaler * 800;  // same as scale75::mult(800)
 
 ### Customizing options
 
-The optional settings (`max_error`, `deep_test`, `clamp_input`, `out_type`, …) live in a traits-class struct. Derive from `mult_bitshift_options` and override only what you want — everything else stays at its default.
+The optional settings (`max_error`, `deep_test`, `clamp_input`, `out_type`, …) live in a traits-class struct. Derive from `mult_bitshift_options` (`mult_bitshift_ratio_options` for `mult_bitshift_ratio`, `mult_bitshift_ratio_dyn_options` for `mult_bitshift_ratio_dyn`) and override only what you want — everything else stays at its default.
 
 ```cpp
 struct fast_safe : mult_bitshift_options {
@@ -217,18 +235,18 @@ New code should prefer the traits-class form — the legacy form is kept only to
 | `max_input_value` | — | Maximum input value the multiplier must handle without overflow |
 | `io_type` | `uint32_t` | Input integer type, and the output type unless `Options::out_type` is set. Must be unsigned. |
 | `calc_type` | `uint32_t` | Internal calculation type. Must be unsigned and at least as wide as `io_type` and `out_type`. |
-| `Options` | `mult_bitshift_options` | Traits-class type carrying the optional flags below. Derive from `mult_bitshift_options` and override only the members you want. |
+| `Options` | `mult_bitshift_options` (`mult_bitshift_ratio_options` for a ratio) | Traits-class type carrying the optional flags below. Derive from `mult_bitshift_options` (for a ratio from `mult_bitshift_ratio_options`) and override only the members you want. |
 
 ### `mult_bitshift_options` members
 
-All members are `static constexpr`. Override only the ones you want by deriving a new struct:
+All members are `static constexpr`. Override only the ones you want by deriving a new struct. `mult_bitshift_ratio_options` has the same members, with `rounding` in place of `trade_speed_for_precision` (see *Exact ratios*):
 
 | Member | Type | Default | Description |
 |---|---|---|---|
 | `max_error` | `uint64_t` | `1` | Maximum allowed deviation from the floating-point expression (in LSB; see *What `mult()` guarantees*). Generalized to `uint64_t` so the struct doesn't depend on the output type; the class casts back to `out_type` internally. Must fit in `out_type`. |
 | `deep_test` | `bool` | `false` | Default `false` runs a quick smoke test of up to 100 samples at compile time — fast to build. Set `true` for the full sweep (up to 65536 samples) when you want maximum assurance and can absorb the compile-time cost. |
 | `clamp_input` | `bool` | `false` | If `true`, clamp inputs above `max_input_value` to `max_input_value` before multiplying — guarantees output stays within the `max_input_value * mult_factor` envelope. Adds ~5 instructions on the hot path. When `false`, the clamp disappears entirely (zero cost). |
-| `trade_speed_for_precision` | `bool` | `false` | Rounding mode. `false` truncates: `mult()` targets `(out_type)(x * multvalue)`. `true` rounds half up: a half-LSB bias is added before the shift, so `mult()` targets `(out_type)(x * multvalue + 0.5)` (both in floating-point, see *What `mult()` guarantees*). Cost: one extra add per call (2–3 instructions in the 64-bit split multiply) — skipped automatically when it provably changes no result, i.e. when `max_input_value × (mult_factor_int mod 2^bitShifts) < 2^(bitShifts−1)` (integer and near-integer factors); results are identical either way. Needs 1 LSB extra headroom in `out_type` (checked at compile time); needs no room in `calc_type` — when `max_input_value × mult_factor_int + 2^(bitShifts−1)` would not fit, the same rounding is done as `((x·M >> (bitShifts−1)) + 1) >> 1` instead (identical results, full shift kept); on Cortex-M0/M0+/M23 that form is also used when it is shorter (see *Rounding without headroom*). **Changes the result, not just its accuracy:** keep `false` where floor semantics matter, e.g. elapsed whole seconds (47999 ticks at 48 kHz must be 0 s, not 1 s) or bucket/index calculations. Not available in the legacy positional form. |
+| `trade_speed_for_precision` | `bool` | `false` | Rounding mode. `false` truncates: `mult()` targets `(out_type)(x * multvalue)`. `true` rounds half up: a half-LSB bias is added before the shift, so `mult()` targets `(out_type)(x * multvalue + 0.5)` (both in floating-point, see *What `mult()` guarantees*). Cost: one extra add per call (2–3 instructions in the 64-bit split multiply) — skipped automatically when it provably changes no result, i.e. when `max_input_value × (mult_factor_int mod 2^bitShifts) < 2^(bitShifts−1)` (integer and near-integer factors); results are identical either way. Needs 1 LSB extra headroom in `out_type` (checked at compile time); needs no room in `calc_type` — when `max_input_value × mult_factor_int + 2^(bitShifts−1)` would not fit, the same rounding is done as `((x·M >> (bitShifts−1)) + 1) >> 1` instead (identical results, full shift kept); on Cortex-M0/M0+/M23 that form is also used when it is shorter (see *Rounding without headroom*). **Changes the result, not just its accuracy:** keep `false` where floor semantics matter, e.g. elapsed whole seconds (47999 ticks at 48 kHz must be 0 s, not 1 s) or bucket/index calculations. Not available in the legacy positional form. Floating-point `multvalue` only; ratios use `rounding`. |
 | `min_output_range` | `uint64_t` | `1` | Minimum required output range: `multvalue * max_input_value` must be at least this many LSBs, otherwise the build fails. Output resolution is 1 LSB of `out_type`, so relative full-scale resolution is ~`1/(multvalue * max_input_value)` — e.g. set `100` to require ≥ 1%. The default `1` only rejects scalers whose every output would be below 1 LSB (which cannot compile anyway). Compile-time only, zero runtime cost. |
 | `out_type` | type | `void` | Return type of `mult()`; `void` means "same as `io_type`". Set it when input and output need different widths (`using out_type = uint32_t;`) — see [Different input and output types](#different-input-and-output-types). Must be an unsigned integer type, and `multvalue * max_input_value` must fit in it (checked at compile time). |
 
@@ -272,7 +290,9 @@ For backwards compatibility, the previous positional signature is preserved as a
 | `max_deviation` | Same as `max_error` — kept for backwards compatibility |
 | `deep_test` | The configured `deep_test` flag from `Options` |
 | `clamp_input` | The configured `clamp_input` flag from `Options` |
-| `trade_speed_for_precision` | The configured rounding mode from `Options` |
+| `rounding` | The rounding mode: `Options::rounding` for a ratio, `nearest` or `floor` from `Options::trade_speed_for_precision` for a floating-point `multvalue` |
+| `ceil_xnz` | Ceiling only: `true` when `mult()` is `⌊x·M/2^s⌋ + (x ≠ 0)`, `false` for an exact multiplier with `⌈x·M/2^s⌉` (see *Exact ratios*) |
+| `trade_speed_for_precision` | `rounding == math_bits_rounding::nearest` (the floating-point form's name) |
 | `min_output_range` | The configured `min_output_range` from `Options` |
 | `out_type` | The type `mult()` returns: `Options::out_type`, or `io_type` when that is `void` |
 | `options` | The `Options` traits-class type itself, exposed for inspection |

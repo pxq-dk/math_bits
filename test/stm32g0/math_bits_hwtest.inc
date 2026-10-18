@@ -51,7 +51,8 @@ template<class T> void check_double(uint32_t id, double f)
     }
 }
 
-// Ratio: reference = exact integer math (x < 2^32, P < 2^32: x*P fits 64 bits).
+// Ratio: reference = exact integer math (x < 2^32, P < 2^32: x*P fits 64 bits). With ceiling, mult() must
+// also never be above the reference.
 template<class T> void check_ratio(uint32_t id)
 {
     const uint64_t P = T::f_value.num, Q = T::f_value.den;
@@ -59,19 +60,38 @@ template<class T> void check_ratio(uint32_t id)
     {
         const uint64_t x = pick_x<T>(i);
         uint64_t ref = (x * P) / Q;
-        if (T::trade_speed_for_precision && 2 * ((x * P) % Q) >= Q) ++ref;
+        if (T::round_nearest && 2 * ((x * P) % Q) >= Q) ++ref;
+        if (T::round_ceiling && (x * P) % Q != 0) ++ref;
         const uint64_t out = (uint64_t)T::mult((typename T::io_type)x);
         ++r[FCHK];
         const uint64_t d = out > ref ? out - ref : ref - out;
-        if (d > (uint64_t)T::max_error) ffail(id, x, out, ref, 0);
+        if (d > (uint64_t)T::max_error || (T::round_ceiling && out > ref)) ffail(id, x, out, ref, 0);
     }
 }
 
 struct me60 : mult_bitshift_options { static constexpr uint64_t max_error = 60; };
 struct rnd60 : me60 { static constexpr bool trade_speed_for_precision = true; };
-struct e0 : mult_bitshift_options { static constexpr uint64_t max_error = 0; };
-struct e0r : e0 { static constexpr bool trade_speed_for_precision = true; };
+struct e0 : mult_bitshift_ratio_options { static constexpr uint64_t max_error = 0; };
+struct e0r : e0 { static constexpr math_bits_rounding rounding = math_bits_rounding::nearest; };
 struct e0o : e0 { using out_type = uint32_t; };
+// rounding = ceiling, cfg 50-57: floor(x*M/2^s) + (x != 0) in the 32-bit and the split multiply, and with
+// an exact multiplier (power-of-two Q) the bias form, also without room for the bias in both paths.
+struct c0  : e0 { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct c1o : c0 { static constexpr uint64_t max_error = 1; using out_type = uint32_t; };
+using SC48  = mult_bitshift_ratio<1000, 48000, 0xFFFFFFFFu, uint32_t, uint64_t, c0>;
+using SCADC = mult_bitshift_ratio<3300, 4095, 4095u, uint16_t, uint32_t, c0>;
+using SC3   = mult_bitshift_ratio<1, 3, 16777215u, uint32_t, uint64_t, c0>;
+using SC1K  = mult_bitshift_ratio<1, 1000, 0xFFFFFFFFull, uint64_t, uint64_t, c1o>;
+using SC34  = mult_bitshift_ratio<3, 4, 65535u, uint32_t, uint32_t, c0>;
+using SCH16 = mult_bitshift_ratio<1, 2, 4095u, uint16_t, uint32_t, c0>;
+using SCH32 = mult_bitshift_ratio<1, 2, 0xFFFFFFFFu, uint32_t, uint64_t, c0>;
+using SC516 = mult_bitshift_ratio<5, 16, 0xFFFFFFFFu, uint32_t, uint64_t, c0>;
+static_assert(SC48::ceil_xnz && SC48::use_split_mul64 && SCADC::ceil_xnz && !SCADC::use_split_mul64 && SC3::ceil_xnz && SC1K::ceil_xnz
+              && !SC34::ceil_xnz && SC34::ceil_bias_fits_for(SC34::mult_factor_int)
+              && !SCH16::ceil_xnz && !SCH16::ceil_bias_fits_for(SCH16::mult_factor_int) && !SCH16::use_split_mul64
+              && !SCH32::ceil_xnz && !SCH32::ceil_bias_fits_for(SCH32::mult_factor_int) && SCH32::use_split_mul64
+              && !SC516::ceil_xnz && SC516::ceil_bias_fits_for(SC516::mult_factor_int) && SC516::use_split_mul64,
+              "static ceiling test configurations no longer cover their paths");
 
 void phase_static()
 {
@@ -85,12 +105,20 @@ void phase_static()
     check_ratio<mult_bitshift_ratio<1, 3, 16777215u, uint32_t, uint64_t, e0r>>(12);
     check_ratio<mult_bitshift_ratio<7, 10, 1000000u, uint32_t, uint64_t, e0>>(13);
     check_ratio<mult_bitshift_ratio<1, 1000, 0xFFFFFFFFull, uint64_t, uint64_t, e0o>>(14);
+    check_ratio<SC48>(50);
+    check_ratio<SCADC>(51);
+    check_ratio<SC3>(52);
+    check_ratio<SC1K>(53);
+    check_ratio<SC34>(54);
+    check_ratio<SCH16>(55);
+    check_ratio<SCH32>(56);
+    check_ratio<SC516>(57);
 }
 
 // ---------------- Dynamic scalers ----------------
 struct adc32 : mult_bitshift_ratio_dyn_options { static constexpr uint64_t num_min = 3000, num_max = 3600, den_min = 4000, den_max = 4095; static constexpr uint64_t max_error = 1; using topology = math_bits_topology::SPSC<>; };
 struct adc64 : adc32 { static constexpr uint64_t max_error = 0; };
-struct adcr  : adc64 { static constexpr bool trade_speed_for_precision = true; };
+struct adcr  : adc64 { static constexpr math_bits_rounding rounding = math_bits_rounding::nearest; };
 struct tick  : mult_bitshift_ratio_dyn_options { static constexpr uint64_t num_min = 1, num_max = 10, den_min = 1000, den_max = 1000000; static constexpr uint64_t max_error = 0; using out_type = uint32_t; using topology = math_bits_topology::SPSC<>; };
 struct tickm : tick { using topology = math_bits_topology::MPSC<>; };
 struct clampc : mult_bitshift_ratio_dyn_options { static constexpr uint64_t num_min = 1, num_max = 5000, den_min = 1, den_max = 4095; static constexpr math_bits_ratio gain_min{ 3000, 4095 }, gain_max{ 3600, 4095 }; static constexpr bool clamp_gain = true; static constexpr uint64_t max_error = 1; };
@@ -106,6 +134,52 @@ constinit AR  ar { 3300, 4095 };
 constinit TK  tk { 1, 48000 };
 constinit TKM tkm{ 1, 48000 };
 constinit CL  cl { 3300, 4095 };
+
+// Ceiling (rounding = math_bits_rounding::ceiling), cfg 31-41. The form floor(x*M/2^s) + (x != 0)
+// (ceil_xnz): 32-bit calc, split multiply with a 32-bit and a 64-bit multiplier, gain clamping,
+// large gains. The bias form (gain 0 allowed, power-of-two denominator), also without room for the
+// bias (ceil_by_sticky) in both multiply paths. Input/output clamping and a fixed denominator: cfg 38-39.
+struct adc32c : adc32  { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct adc64c : adc32c { static constexpr uint64_t max_error = 0; };
+struct tickc  : tick   { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct clampcc : clampc { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct stk : mult_bitshift_ratio_dyn_options { static constexpr uint64_t num_min = 0, num_max = 1, den_min = 2, den_max = 3, max_error = 0;
+                                               static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct stk64 : stk { static constexpr uint64_t num_min = 1; using out_type = uint32_t; };
+struct zeroc : adc32c { static constexpr uint64_t num_min = 0; };
+struct p2c : mult_bitshift_ratio_dyn_options { static constexpr uint64_t num_min = 1, num_max = 1 << 20, den_min = 1 << 20, den_max = 1 << 20, max_error = 0;
+                                               static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; using out_type = uint32_t; };
+struct bigc : mult_bitshift_ratio_dyn_options { static constexpr uint64_t num_min = 1, num_max = 1000, den_min = 1, den_max = 1000, max_error = 2;
+                                                static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; using out_type = uint32_t; };
+using A32C = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, adc32c>;
+using A64C = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, adc64c>;
+using TKC  = mult_bitshift_ratio_dyn<16777215u, uint32_t, uint64_t, tickc>;
+using CLC  = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, clampcc>;
+using S32  = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, stk>;
+using S64  = mult_bitshift_ratio_dyn<0xFFFFFFFFu, uint32_t, uint64_t, stk64>;
+using BIG  = mult_bitshift_ratio_dyn<65535u, uint16_t, uint64_t, bigc>;
+using ZC   = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, zeroc>;
+using P2C  = mult_bitshift_ratio_dyn<16777215u, uint32_t, uint64_t, p2c>;
+static_assert(A32C::ceil_xnz && A64C::ceil_xnz && A64C::use_split_mul64 && TKC::ceil_xnz && sizeof(TKC::m_type) == 8 && CLC::ceil_xnz
+              && BIG::ceil_xnz && S32::ceil_by_sticky && !S32::use_split_mul64 && S64::ceil_by_sticky && S64::use_split_mul64
+              && !ZC::ceil_xnz && !ZC::ceil_by_sticky && !P2C::ceil_xnz && !P2C::ceil_by_sticky && P2C::use_split_mul64,
+              "ceiling test configurations no longer cover their paths");
+constinit A32C a32c{ 3300, 4095 };
+constinit A64C a64c{ 3300, 4095 };
+constinit TKC  tkc { 1, 48000 };
+constinit CLC  clc { 3300, 4095 };
+constinit S32  s32 { 1, 2 };
+constinit S64  s64 { 1, 2 };
+constinit BIG  big { 500, 7 };
+constinit ZC   zc  { 3300, 4095 };
+constinit P2C  p2c_o{ 3300, 1 << 20 };
+
+// Error within max_error: floor and nearest are never below the reference, ceiling never above it.
+template<class T> bool err_ok(uint64_t out, uint64_t ref)
+{
+    const uint64_t k = (uint64_t)T::options::max_error;
+    return T::round_ceiling ? (out <= ref && ref - out <= k) : (out >= ref && out - ref <= k);
+}
 
 template<class T> void check_dyn(uint32_t id, T& obj)
 {
@@ -139,10 +213,11 @@ template<class T> void check_dyn(uint32_t id, T& obj)
             const uint64_t mi = (uint64_t)T::max_input_int;
             const uint64_t x = i < 10 ? (uint64_t)i : (i < 20 ? mi - (uint64_t)(i - 10) : xs32(rng_main) % (mi + 1));
             uint64_t ref = (x * en) / ed;
-            if (T::trade_speed_for_precision && 2 * ((x * en) % ed) >= ed) ++ref;
+            if (T::round_nearest && 2 * ((x * en) % ed) >= ed) ++ref;
+            if (T::round_ceiling && (x * en) % ed != 0) ++ref;
             const uint64_t out = (uint64_t)obj.mult((typename T::io_type)x);
             ++r[FCHK];
-            if (out < ref || out - ref > (uint64_t)O::max_error) ffail(id, x, out, ref, (uint32_t)(en << 16 | (ed & 0xFFFF)));
+            if (!err_ok<T>(out, ref)) ffail(id, x, out, ref, (uint32_t)(en << 16 | (ed & 0xFFFF)));
         }
     }
 }
@@ -157,6 +232,8 @@ struct cout  : adc32 { static constexpr uint64_t output_limit = 3300; static con
 struct cboth : adcr  { static constexpr uint64_t output_limit = 3300; static constexpr bool clamp_output = true, clamp_input = true; };
 struct cfix0 : adc64 { static constexpr uint64_t den_min = 4095, den_max = 4095; };
 struct cfix  : cfix0 { static constexpr uint64_t output_limit = 3200; static constexpr bool clamp_output = true; };
+struct cbothc : adc64c { static constexpr uint64_t output_limit = 3300; static constexpr bool clamp_output = true, clamp_input = true; };
+struct cfixc  : cbothc { static constexpr uint64_t den_min = 4095, den_max = 4095; static constexpr bool clamp_input = false; };
 using CIN = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, cin>;
 using COU = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, cout>;
 using CBO = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, cboth>;
@@ -167,6 +244,10 @@ constinit COU cou_o{ 3300, 4095 };
 constinit CBO cbo_o{ 3300, 4095 };
 constinit CF0 cf0_o{ 3300 };
 constinit CFX cfx_o{ 3300 };
+using CBC = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, cbothc>;
+using CFC = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, cfixc>;
+constinit CBC cbc_o{ 3300, 4095 };
+constinit CFC cfc_o{ 3300 };
 
 template<class T> void check_clamp(uint32_t id, T& obj)
 {
@@ -200,9 +281,10 @@ template<class T> void check_clamp(uint32_t id, T& obj)
             }
             const uint64_t xc = x > mi ? mi : x;
             uint64_t ref = (xc * num) / den;
-            if (T::trade_speed_for_precision && 2 * ((xc * num) % den) >= den) ++ref;
+            if (T::round_nearest && 2 * ((xc * num) % den) >= den) ++ref;
+            if (T::round_ceiling && (xc * num) % den != 0) ++ref;
             if (O::clamp_output && ref > O::output_limit) ref = O::output_limit;
-            if (out < ref || out - ref > (uint64_t)O::max_error) ffail(id, x, out, ref, (uint32_t)(num << 16 | (den & 0xFFFF)));
+            if (!err_ok<T>(out, ref)) ffail(id, x, out, ref, (uint32_t)(num << 16 | (den & 0xFFFF)));
         }
     }
 }
@@ -220,6 +302,17 @@ void phase_dyn()
     check_clamp(28, cbo_o);
     check_clamp(29, cf0_o);
     check_clamp(30, cfx_o);
+    check_dyn(31, a32c);
+    check_dyn(32, a64c);
+    check_dyn(33, tkc);
+    check_dyn(34, clc);
+    check_dyn(35, s32);
+    check_dyn(36, s64);
+    check_dyn(37, big);
+    check_clamp(38, cbc_o);
+    check_clamp(39, cfc_o);
+    check_dyn(40, zc);
+    check_dyn(41, p2c_o);
 }
 
 // ---------------- Phase 3: concurrency stress ----------------

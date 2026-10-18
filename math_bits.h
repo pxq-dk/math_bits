@@ -88,14 +88,21 @@
     #endif
 #endif
 
-// Default options for mult_bitshift, passed as a traits-class type template parameter.
-// Derive from this and override only the members you want to change:
+// Options are passed as a traits-class type template parameter. Derive from the options struct of
+// the scaler and override only the members you want to change:
+//   mult_bitshift (floating-point multvalue)    mult_bitshift_options
+//   mult_bitshift_ratio                         mult_bitshift_ratio_options
+//   mult_bitshift_ratio_dyn                     mult_bitshift_ratio_dyn_options
+// The ratio types check that their options derive from their own struct; they select the rounding
+// with `rounding`, the floating-point form with trade_speed_for_precision.
 //
 //     struct fast_safe : mult_bitshift_options {
 //         static constexpr bool deep_test   = false;
 //         static constexpr bool clamp_input = true;
 //     };
 //     using my_scaler = mult_bitshift<0.75, 1000u, uint32_t, uint32_t, fast_safe>;
+//
+// Members of all three (math_bits_detail::common_options):
 //
 // max_error is generalized to uint64_t here so the struct definition does not
 // depend on the output type; the class casts it back to out_type internally.
@@ -106,7 +113,14 @@
 //       struct ms_opts : mult_bitshift_options { using out_type = uint32_t; };
 //   Must be unsigned, and multvalue * max_input_value must fit in it (compile-time checked).
 //
-// trade_speed_for_precision (default false):
+// min_output_range (default 1):
+//   Minimum required output range, i.e. multvalue * max_input_value must be at least
+//   this many LSBs. Output resolution is 1 LSB of out_type, so the relative resolution at
+//   full scale is ~1/(multvalue * max_input_value). Raise it to get a compile error when
+//   the output would be too coarse, e.g. 100 for >= 1% full-scale resolution.
+//   The default 1 only rejects scalers whose every output would be below 1 LSB.
+//
+// Rounding — floating-point form, trade_speed_for_precision (default false):
 //   When false, mult() truncates — matches (out_type)(input * mult_factor) with up
 //   to 1 LSB quantization noise vs the float ideal.
 //   When true, mult() adds a half-LSB bias before the shift so the output matches
@@ -118,26 +132,42 @@
 //   otherwise the static
 //   sweep tells you to widen calc_type or reduce max_input_value.
 //
-// min_output_range (default 1):
-//   Minimum required output range, i.e. multvalue * max_input_value must be at least
-//   this many LSBs. Output resolution is 1 LSB of out_type, so the relative resolution at
-//   full scale is ~1/(multvalue * max_input_value). Raise it to get a compile error when
-//   the output would be too coarse, e.g. 100 for >= 1% full-scale resolution.
-//   The default 1 only rejects scalers whose every output would be below 1 LSB.
-struct mult_bitshift_options
+// Rounding — ratio types, rounding (default math_bits_rounding::floor):
+//   floor:    mult() targets floor(x * num / den).
+//   nearest:  floor(x * num / den + 1/2), i.e. to nearest with ties up. Same implementation and
+//             cost as trade_speed_for_precision above.
+//   ceiling:  ceil(x * num / den). mult() is never above it, at most max_error below.
+enum class math_bits_rounding : uint8_t { floor, nearest, ceiling };
+
+namespace math_bits_detail
 {
-    static constexpr uint64_t max_error                 = 1;
-    static constexpr bool     deep_test                 = false;
-    static constexpr bool     clamp_input               = false;
-    static constexpr bool     trade_speed_for_precision = false;
-    static constexpr uint64_t min_output_range          = 1;
-    using out_type = void;
+    // Members shared by the options of all scalers (see above).
+    struct common_options
+    {
+        static constexpr uint64_t max_error        = 1;
+        static constexpr bool     deep_test        = false;
+        static constexpr bool     clamp_input      = false;
+        static constexpr uint64_t min_output_range = 1;
+        using out_type = void;
+    };
+}
+
+// Default options for mult_bitshift with a floating-point multvalue.
+struct mult_bitshift_options : math_bits_detail::common_options
+{
+    static constexpr bool trade_speed_for_precision = false;
+};
+
+// Default options for mult_bitshift_ratio (and mult_bitshift with a math_bits_ratio multvalue).
+struct mult_bitshift_ratio_options : math_bits_detail::common_options
+{
+    static constexpr math_bits_rounding rounding = math_bits_rounding::floor;
 };
 
 // An exact ratio num / den as multvalue, for scaling by a fraction without floating point:
 //     using ticks_to_ms = mult_bitshift<math_bits_ratio{1000, 48000}, 0xFFFFFFFFu>;
 // or, shorter, mult_bitshift_ratio<1000, 48000, 0xFFFFFFFFu> (below). mult() is then checked
-// against the exact integer result floor(x * num / den) (with trade_speed_for_precision:
+// against the exact integer result floor(x * num / den) (with rounding = math_bits_rounding::nearest:
 // floor(x * num / den + 1/2)), not against a floating-point expression. The ratio is reduced
 // (1000/48000 -> 1/48); it must not reduce to an integer (den 1): integer multiplication is not
 // supported, the compiler already does it optimally.
@@ -149,6 +179,10 @@ struct math_bits_ratio
 
 namespace math_bits_detail
 {
+    // Whether a multvalue is an exact ratio (math_bits_ratio) rather than a floating-point value.
+    template<auto v>
+    inline constexpr bool is_ratio_value = std::is_same_v<std::remove_cv_t<decltype(v)>, math_bits_ratio>;
+
     // Minimal unsigned 128-bit integer for exact compile-time arithmetic (parameter derivation and
     // the self-test reference). Used only in constant evaluation: arm-none-eabi has no __int128,
     // and its long double is a 53-bit double, which cannot even represent UINT64_MAX.
@@ -482,7 +516,7 @@ public:
     static constexpr float_type mult_factor = MultType::mult_factor;        // Floating-point multiplier
 
     // Reference result for `input`. For a ratio P/Q the exact integer result floor(x * P / Q)
-    // (with trade_speed_for_precision floor(x * P / Q + 1/2)). For a floating-point multvalue,
+    // (rounding to nearest: floor(x * P / Q + 1/2)). For a floating-point multvalue,
     // what the floating-point expression gives, evaluated in
     // multvalue's own type T with IEEE rounding (to nearest, ties to even) at every step:
     //   truncation (default):          (out_type)( (T)input * multvalue )
@@ -492,7 +526,7 @@ public:
     // 128-bit integers (math_bits_detail::ieee_mul_floor), so it does not depend on the host's or
     // target's floating-point unit. reference_bias is only used for the floating-point starting
     // guess in level_start().
-    static constexpr long double reference_bias = MultType::trade_speed_for_precision ? 0.5L : 0.0L;
+    static constexpr long double reference_bias = MultType::round_nearest ? 0.5L : 0.0L;
     static constexpr int reference_precision = std::numeric_limits<float_type>::digits;
     // multvalue = mant * 2^exp as the IEEE emulation takes it (f_value.den is 1 for a floating-point multvalue).
     static constexpr math_bits_detail::dyadic f_ieee = { MultType::f_value.num, MultType::f_value.exp };
@@ -503,7 +537,9 @@ public:
     // (in units of 2^-ref_k): a value can only be rounded up onto the next integer when its
     // fractional bits from ref_step upward are all ones; only then is the full emulation needed.
     static constexpr int ref_k = -f_ieee.exp;
-    static constexpr bool ref_has_bias = MultType::trade_speed_for_precision;
+    static constexpr bool ref_has_bias = MultType::round_nearest;
+    // Ratio with rounding = ceiling: reference ceil(x * P / Q); mult() is never above it.
+    static constexpr bool ref_ceiling = MultType::round_ceiling;
     static constexpr int calc_ref_step()
     {
     	using math_bits_detail::u128;
@@ -522,11 +558,14 @@ public:
     	using math_bits_detail::u128;
     	if constexpr (MultType::is_ratio)
     	{
-    		// Exact: floor(x * P / Q), or with the bias floor(x * P / Q + 1/2) = q + (2r >= Q).
+    		// Exact: floor(x * P / Q), or with the bias floor(x * P / Q + 1/2) = q + (2r >= Q), or
+    		// ceil(x * P / Q) = q + (r != 0).
     		constexpr math_bits_detail::rational f = MultType::f_value;
     		const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(
     			math_bits_detail::mul64(static_cast<uint64_t>(input), f.num), f.den);
-    		if constexpr (ref_has_bias)
+    		if constexpr (ref_ceiling)
+    			return static_cast<out_type>(qr.rem != 0 ? qr.quot.lo + 1u : qr.quot.lo);
+    		else if constexpr (ref_has_bias)
     			return static_cast<out_type>(qr.rem >= f.den - qr.rem ? qr.quot.lo + 1u : qr.quot.lo);
     		else
     			return static_cast<out_type>(qr.quot.lo);
@@ -576,7 +615,9 @@ public:
     	const out_type res_min = (res_expected > max_deviation)
     		? static_cast<out_type>(res_expected - max_deviation)
     		: out_type{0};
-    	const out_type res_max = (res_expected < std::numeric_limits<out_type>::max() - max_deviation)
+    	// With ceiling mult() is never above the reference (by construction, checked here too).
+    	const out_type res_max = ref_ceiling ? res_expected
+    		: (res_expected < std::numeric_limits<out_type>::max() - max_deviation)
     		? static_cast<out_type>(res_expected + max_deviation)
     		: std::numeric_limits<out_type>::max();
 
@@ -618,10 +659,10 @@ public:
     //     is at the level's largest x and the worst undershoot at its smallest x. Checking both
     //     ends of each level is exact. (Max_input failing is a proven failure: endpoint check.)
     //
-    // Not applied when bitShifts == 0 with trade_speed_for_precision: round_bias is then 0
+    // Not applied when rounding to nearest with bitShifts == 0: round_bias is then 0
     // while the reference still adds 0.5, so the shared-bias premise does not hold.
     static constexpr bool analysis_applies =
-    	!(MultType::trade_speed_for_precision && MultType::bitShifts == 0);
+    	!(MultType::round_nearest && MultType::bitShifts == 0);
 
     // Informational only (approximate, long double): handy for inspecting a configuration.
     // The decisions below use the exact values (exact_quant_error).
@@ -694,7 +735,7 @@ public:
     	while (m_odd && !(m_odd & 1u)) { m_odd >>= 1; ++tz; }
     	const int bw_m = static_cast<int>(std::bit_width(m_odd));
     	if (bw_in > P || bw_in + bw_m > P) return false;                 // conversion or product rounds
-    	if (!MultType::trade_speed_for_precision) return true;
+    	if (!MultType::round_nearest) return true;
     	const int lowest = f.exp + tz;                                    // weight of the product's lowest bit
     	if (lowest >= -1) return calc_max_product_floor().bit_width() + 1 <= P;   // + 2^-1 bit
     	return bw_in + bw_m + 1 <= P;                                     // + 0.5 inside range, + carry
@@ -724,12 +765,24 @@ public:
     // never reaches the next integer, and mult(x) equals the reference for every x <= max_input:
     //   0 <= max_input * e < 1/Q (1/(2Q))  <=>  e >= 0  and  max_input * num < 2^s (2^(s-1)),
     // with e = num / (Q * 2^s) (exact_quant_error). The classic division-by-a-constant argument.
+    // Ceiling, the mirror image: mult(x) = floor(x*M/2^s) + (x != 0) with M below P*2^s/Q (e < 0) is
+    // exact when max_input * |e| <= 1/Q  <=>  max_input * num <= 2^s (an exact value n is lowered by
+    // more than 0 and at most 1/Q < 1, a value n + j/Q, j >= 1, by at most j/Q); with an exact M
+    // (Q a power of two, mult(x) = ceil(x*M/2^s)) always.
     static constexpr bool calc_ratio_exact()
     {
     	if constexpr (!MultType::is_ratio || !analysis_applies) return false;
+    	else if constexpr (ref_ceiling)
+    	{
+    		return exact_error.den_exp == MultType::bitShifts
+    			&& (exact_error.num == math_bits_detail::u128(0)
+    			    || (!exact_error.high
+    			        && math_bits_detail::cmp_scaled_products(exact_error.num, static_cast<uint64_t>(MultType::max_input_int), 0,
+    			                                                 math_bits_detail::u128(1), 1, MultType::bitShifts) <= 0));
+    	}
     	else
     	{
-    		constexpr int s = MultType::bitShifts - (MultType::trade_speed_for_precision ? 1 : 0);
+    		constexpr int s = MultType::bitShifts - (MultType::round_nearest ? 1 : 0);
     		return exact_error.high && exact_error.den_exp == MultType::bitShifts
     			&& math_bits_detail::cmp_scaled_products(exact_error.num, static_cast<uint64_t>(MultType::max_input_int), 0,
     			                                         math_bits_detail::u128(1), 1, s) < 0;
@@ -802,6 +855,11 @@ public:
     		using math_bits_detail::u128;
     		constexpr math_bits_detail::rational f = MultType::f_value;
     		if (n == 0) return 0;
+    		if constexpr (ref_ceiling)                                   // ceil(x*P/Q) >= n <=> x*P > (n-1)*Q
+    		{
+    			const u128 x = math_bits_detail::divmod(math_bits_detail::mul64(n - 1, f.den), f.num).quot + u128(1);
+    			return (x.hi != 0 || x.lo > x_max) ? x_max : x.lo;
+    		}
     		const u128 V = ref_has_bias ? math_bits_detail::mul64(n - 1, f.den) + u128(f.den - f.den / 2)
     		                             : math_bits_detail::mul64(n, f.den);
     		const u128 x = math_bits_detail::divmod(V + u128(f.num - 1), f.num).quot;
@@ -831,6 +889,10 @@ public:
     // Checking the worst input of each such residue (found with the inverse of P mod Q) is therefore
     // exact for every input <= max_input, without sampling. Used when at most residue_budget
     // residues qualify; otherwise the level walk below runs as for a floating-point multvalue.
+    // Ceiling is the mirror image: ceil(x*P/Q + x*e) = -floor(x*(-P)/Q - x*e), so the same plan runs
+    // on the mirrored residue v = (-x*P) mod Q with the sign of e flipped (S = Q). That is exact for
+    // ceil(x*M/2^s), and a superset of the failing residues for floor(x*M/2^s) + (x != 0) (which
+    // fails by the same inequality, only strict); residue_ok maps v back to x*P mod Q = (Q - v) mod Q.
     struct residue_plan
     {
     	bool     applies;              // false: use the level walk
@@ -861,7 +923,7 @@ public:
     		const u128 w_ceil  = ((w_floor << s) == T) ? w_floor : w_floor + u128(1);
     		const u128 Sk = math_bits_detail::mul64(S, static_cast<uint64_t>(max_deviation));
     		uint64_t v_lo, v_hi;                                         // candidate v in [v_lo, v_hi]
-    		if (exact_error.high)
+    		if (exact_error.high != ref_ceiling)
     		{
     			const u128 Sk1 = Sk + u128(S);
     			const u128 V = (w_floor < Sk1) ? Sk1 - w_floor : u128(0);
@@ -911,8 +973,9 @@ public:
     	for (int i = 0; i < 2; ++i)
     	{
     		if (residue.lo[i] > residue.hi[i]) continue;
-    		for (uint64_t r = residue.lo[i]; r <= residue.hi[i]; ++r)
+    		for (uint64_t v = residue.lo[i]; v <= residue.hi[i]; ++v)
     		{
+    			const uint64_t r = (ref_ceiling && v != 0) ? Q - v : v;  // x * P mod Q (mirrored for ceiling)
     			const uint64_t x0 = math_bits_detail::divmod(math_bits_detail::mul64(r, p_inv), Q).rem;   // x0 * P == r (mod Q)
     			if (x0 > x_max) continue;
     			if (!number_ok(static_cast<io_type>(x0 + (x_max - x0) / Q * Q))) return false;
@@ -960,10 +1023,12 @@ public:
 //
 // Options is a traits-class type carrying the optional settings (see
 // mult_bitshift_options). Pass mult_bitshift_options for defaults, or
-// derive a struct and override only the members you want.
+// derive a struct and override only the members you want. With a math_bits_ratio multvalue
+// the options derive from mult_bitshift_ratio_options instead (also the default then).
 template<auto multvalue, auto max_input_value,
          typename IoType=uint32_t, typename CalcType=uint32_t,
-         typename Options = mult_bitshift_options>
+         typename Options = std::conditional_t<math_bits_detail::is_ratio_value<multvalue>,
+                                               mult_bitshift_ratio_options, mult_bitshift_options>>
 class mult_bitshift
 {
 public:
@@ -973,20 +1038,54 @@ public:
     using out_type = std::conditional_t<std::is_void_v<typename Options::out_type>,
                                         IoType, typename Options::out_type>;
     // multvalue is an exact ratio (math_bits_ratio) or a floating-point value.
-    static constexpr bool is_ratio = std::is_same_v<std::remove_cv_t<decltype(multvalue)>, math_bits_ratio>;
+    static constexpr bool is_ratio = math_bits_detail::is_ratio_value<multvalue>;
     // Type of the multiplier (float, double, or long double); long double for a ratio, where it
     // only types the informational mult_factor.
     using float_type = std::conditional_t<is_ratio, long double, std::remove_cv_t<decltype(multvalue)>>;
     using options = Options;
     using mult_type = mult_bitshift<multvalue, max_input_value, io_type, calc_type, Options>;
 
+    // A ratio takes options derived from mult_bitshift_ratio_options (rounding), a floating-point
+    // multvalue those of mult_bitshift_options (trade_speed_for_precision). The option of the other
+    // form is rejected, so that it is not silently ignored when set in a derived struct.
+    static_assert(!is_ratio || std::is_base_of_v<mult_bitshift_ratio_options, Options>,
+                  "mult_bitshift_ratio: Options must derive from mult_bitshift_ratio_options");
+    static_assert(!is_ratio || !std::is_base_of_v<mult_bitshift_ratio_options, Options> || !requires { Options::trade_speed_for_precision; },
+                  "mult_bitshift_ratio: trade_speed_for_precision is not an option of the ratio types, use "
+                  "static constexpr math_bits_rounding rounding = math_bits_rounding::nearest;");
+    static_assert(is_ratio || !std::is_base_of_v<mult_bitshift_ratio_options, Options>,
+                  "mult_bitshift with a floating-point multvalue: Options must derive from mult_bitshift_options, "
+                  "not mult_bitshift_ratio_options");
+    static_assert(is_ratio || std::is_base_of_v<mult_bitshift_ratio_options, Options> || !requires { Options::rounding; },
+                  "mult_bitshift with a floating-point multvalue: rounding is an option of the ratio types, use "
+                  "static constexpr bool trade_speed_for_precision = true; for rounding to nearest");
+
     // Surface the values from the options traits class as plain constants so
     // the rest of the class can read them with the original short names.
     static constexpr out_type max_error                 = static_cast<out_type>(Options::max_error);
     static constexpr bool    deep_test                  = Options::deep_test;
     static constexpr bool    clamp_input                = Options::clamp_input;
-    static constexpr bool    trade_speed_for_precision  = Options::trade_speed_for_precision;
     static constexpr uint64_t min_output_range          = Options::min_output_range;
+    // Rounding mode: Options::rounding for a ratio, from Options::trade_speed_for_precision for a
+    // floating-point multvalue. (The requires guards leave a wrong options struct to the checks above.)
+    static constexpr math_bits_rounding rounding = []
+    {
+        if constexpr (is_ratio)
+        {
+            if constexpr (requires { Options::rounding; }) return Options::rounding;
+            else return math_bits_rounding::floor;
+        }
+        else
+        {
+            if constexpr (requires { Options::trade_speed_for_precision; })
+                return Options::trade_speed_for_precision ? math_bits_rounding::nearest : math_bits_rounding::floor;
+            else return math_bits_rounding::floor;
+        }
+    }();
+    static constexpr bool    round_nearest              = rounding == math_bits_rounding::nearest;
+    static constexpr bool    round_ceiling              = rounding == math_bits_rounding::ceiling;   // ratio only
+    // The floating-point form's name for round_nearest (kept for existing code).
+    static constexpr bool    trade_speed_for_precision  = round_nearest;
 
     static_assert(std::is_integral_v<out_type> && std::is_unsigned_v<out_type>,
                   "Options::out_type must be void (= io_type) or an unsigned integer type");
@@ -1051,16 +1150,16 @@ public:
                       "max_input_value must fit in io_type!");
 
         // Ensure the result of mult(max_input_value) fits in out_type, with headroom for max_error
-        // (and an extra LSB when trade_speed_for_precision is on, since round-half-up can bump
-        //  the float ideal up by half an LSB at the out_type scale before the cast).
-        static_assert(static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - max_error
-                          >= (trade_speed_for_precision ? 1u : 0u)
-                      && cmp_product(0, static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - max_error
-                                         - (trade_speed_for_precision ? 1u : 0u)) <= 0,
+        // (and an extra LSB when round_nearest is on, since round-half-up can bump
+        //  the float ideal up by half an LSB at the out_type scale before the cast). With ceiling,
+        // mult() is never above ceil(multvalue * max_input_value): no headroom needed.
+        constexpr uint64_t headroom = round_ceiling ? 0u : static_cast<uint64_t>(max_error) + (round_nearest ? 1u : 0u);
+        static_assert(static_cast<uint64_t>(std::numeric_limits<out_type>::max()) >= headroom
+                      && cmp_product(0, static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - headroom) <= 0,
                       "multvalue * max_input_value would overflow out_type (no headroom for max_error or rounding bias)!");
 
         // Reject scalers: if the product is < 1, every valid input maps to an output
-        // below 1 LSB (always 0 when truncating; at most 0/1 with trade_speed_for_precision).
+        // below 1 LSB (always 0 when truncating; at most 0/1 with round_nearest).
         static_assert(cmp_product(0, 1) >= 0,
                       "multvalue * max_input_value < 1: every ideal output would be below 1 LSB. "
                       "Scale the result up (e.g. output in milli-units) or raise max_input_value.");
@@ -1123,7 +1222,7 @@ public:
     static_assert(bitShifts < std::numeric_limits<calc_type>::digits,
                   "bitShifts must be < digits(calc_type) — required for well-defined shift behavior!");
 
-    // Half-LSB rounding bias used by mult() when trade_speed_for_precision is enabled.
+    // Half-LSB rounding bias used by mult() when round_nearest is enabled.
     // Zero when bitShifts == 0 (no shift, no rounding needed) — guards against UB on `1 << -1`.
     // Referenced by both mult() and the calc_type overflow assert below.
     static constexpr calc_type round_bias = (bitShifts == 0)
@@ -1138,7 +1237,7 @@ public:
     // identical with and without the bias, and the add is dropped (one instruction less).
     static constexpr bool bias_needed_for(calc_type M)
     {
-        if (!trade_speed_for_precision || bitShifts == 0) return false;
+        if (!round_nearest || bitShifts == 0) return false;
         const uint64_t r = static_cast<uint64_t>(M) & ((uint64_t{1} << bitShifts) - 1);
         return !(math_bits_detail::mul64(static_cast<uint64_t>(max_input_int), r)
                  < (math_bits_detail::u128(1) << (bitShifts - 1)));
@@ -1154,6 +1253,25 @@ public:
     {
         return math_bits_detail::mul64(static_cast<uint64_t>(max_input_int), static_cast<uint64_t>(M))
                + math_bits_detail::u128(static_cast<uint64_t>(round_bias))
+               <= math_bits_detail::u128(static_cast<uint64_t>(std::numeric_limits<calc_type>::max()));
+    }
+
+    // Ceiling (ratio only): the multiplier is M = floor(P * 2^s / Q), below P * 2^s / Q unless Q is a
+    // power of two up to 2^s. Below it, mult() is floor(x * M / 2^s) + (x != 0): no bias and no low
+    // bits of the product, and never below ceil(x * M / 2^s) (it differs only where x * M / 2^s is an
+    // integer, and x * P / Q is above that). With an exact M it is ceil(x * M / 2^s), by the bias
+    // 2^s - 1, or, without room for it, by (A >> s) + (any of the s low bits set).
+    static constexpr bool ceil_xnz_for(calc_type M)
+    {
+        if constexpr (!round_ceiling) return false;
+        else return !(math_bits_detail::mul64(static_cast<uint64_t>(M), f_value.den)
+                      == (math_bits_detail::u128(f_value.num) << bitShifts));
+    }
+    static constexpr bool ceil_bias_fits_for(calc_type M)
+    {
+        return bitShifts == 0
+            || math_bits_detail::mul64(static_cast<uint64_t>(max_input_int), static_cast<uint64_t>(M))
+               + math_bits_detail::u128((uint64_t{1} << bitShifts) - 1u)
                <= math_bits_detail::u128(static_cast<uint64_t>(std::numeric_limits<calc_type>::max()));
     }
 
@@ -1237,6 +1355,19 @@ public:
             lo += b_lo;
             hi += b_hi + (lo < b_lo ? 1u : 0u); // + carry out of the low word
         }
+        else if constexpr (ceil_xnz_for(M))
+            return static_cast<out_type>((hi >> (bitShifts - 32)) + (input_val != 0 ? 1u : 0u));
+        else if constexpr (round_ceiling && !ceil_bias_fits_for(M))
+        {
+            // (A >> s) + (any bit below s set): the low word and the low s-32 bits of hi.
+            constexpr uint32_t hi_mask = (uint32_t{1} << (bitShifts - 32)) - 1u;
+            return static_cast<out_type>((hi >> (bitShifts - 32)) + ((lo | (hi & hi_mask)) != 0 ? 1u : 0u));
+        }
+        else if constexpr (round_ceiling)
+        {
+            constexpr uint32_t b_hi = static_cast<uint32_t>(((uint64_t{1} << bitShifts) - 1u) >> 32);
+            hi += b_hi + (lo != 0 ? 1u : 0u);   // bias 2^s - 1: its low word 0xFFFFFFFF carries iff lo != 0
+        }
 
         // The output fits out_type (<= 32 bits), so multvalue * max_input_value < 2^32, and the
         // largest shift with multvalue * max_input_value * 2^bitShifts <= 2^64 - 1 is >= 32: the
@@ -1280,6 +1411,15 @@ public:
                 // bitShifts headroom permits. Skipped when it provably changes no result.
                 output_val += round_bias;
             }
+            else if constexpr (ceil_xnz_for(M))
+                return static_cast<out_type>((output_val >> bitShifts) + (input_val != 0 ? 1u : 0u));
+            else if constexpr (round_ceiling && bitShifts > 0 && !ceil_bias_fits_for(M))
+            {
+                constexpr calc_type low_mask = static_cast<calc_type>((calc_type(1) << bitShifts) - 1u);
+                return static_cast<out_type>((output_val >> bitShifts) + ((output_val & low_mask) != 0 ? 1u : 0u));
+            }
+            else if constexpr (round_ceiling && bitShifts > 0)
+                output_val += static_cast<calc_type>((calc_type(1) << bitShifts) - 1u);   // ceil: bias 2^s - 1
             output_val = output_val >> bitShifts; // Divide by 2^bitShifts
             return static_cast<out_type>(output_val); // Cast to the output type
         }
@@ -1309,7 +1449,8 @@ public:
         using out_type   = typename mult_bitshift::out_type;
         using calc_type  = typename mult_bitshift::calc_type;
         static constexpr bool       is_ratio        = mult_bitshift::is_ratio;
-        static constexpr bool       trade_speed_for_precision = mult_bitshift::trade_speed_for_precision;
+        static constexpr bool       round_nearest   = mult_bitshift::round_nearest;
+        static constexpr bool       round_ceiling   = mult_bitshift::round_ceiling;
         static constexpr out_type   max_deviation   = static_cast<out_type>(E);
         static constexpr io_type    max_input_int   = mult_bitshift::max_input_int;
         static constexpr float_type mult_factor     = mult_bitshift::mult_factor;
@@ -1346,7 +1487,7 @@ public:
         constexpr u128 calc_max = static_cast<uint64_t>(std::numeric_limits<calc_type>::max());
         return m.hi == 0 && m.lo != 0 && m <= calc_max
             && math_bits_detail::mul64(static_cast<uint64_t>(max_input_int), m.lo)
-               + u128(trade_speed_for_precision ? static_cast<uint64_t>(round_bias) : uint64_t{0}) <= calc_max;
+               + u128(round_nearest ? static_cast<uint64_t>(round_bias) : uint64_t{0}) <= calc_max;
     }
 
     // The default (round-to-nearest) multiplier, exposed for inspection.
@@ -1355,7 +1496,13 @@ public:
     static constexpr calc_type choose_mult_factor_int()
     {
         constexpr calc_type nearest = mult_factor_int_nearest;
-        if constexpr (mult_alt_u128 == mult_nearest_u128 || !candidate_fits(mult_alt_u128))
+        if constexpr (round_ceiling)
+        {
+            // Ceiling: rounded down (see ceil_xnz_for). A larger multiplier would put exact results
+            // above the reference, a smaller one is lower everywhere: no alternative.
+            return static_cast<calc_type>(calc_mult_floor().lo);
+        }
+        else if constexpr (mult_alt_u128 == mult_nearest_u128 || !candidate_fits(mult_alt_u128))
         {
             return nearest;                                    // exact multiplier, or no valid alternative
         }
@@ -1402,6 +1549,9 @@ public:
     // before the shift (true) or done by the shift-based rounding (false, see round_by_shift_for).
     static constexpr bool rounding_bias_needed = bias_needed_for(mult_factor_int);
     static constexpr bool rounding_bias_added  = rounding_bias_needed && !round_by_shift_for(mult_factor_int);
+    // Ceiling: whether mult() is floor(x * M / 2^s) + (x != 0) (M below the exact value), else the
+    // exact multiplier with ceil(x * M / 2^s) (see ceil_xnz_for).
+    static constexpr bool ceil_xnz = ceil_xnz_for(mult_factor_int);
 
     // Precomputed maximum output: mult(max_input_int). Used by the clamp_input early-return path,
     // and exposed publicly so callers can query the maximum value mult() will ever return.
@@ -1485,7 +1635,7 @@ using mult_bitshift_legacy = mult_bitshift<
 // math_bits_ratio; the class reduces P/Q itself).
 template<uint64_t P, uint64_t Q, auto max_input_value,
          typename IoType=uint32_t, typename CalcType=uint32_t,
-         typename Options = mult_bitshift_options>
+         typename Options = mult_bitshift_ratio_options>
 using mult_bitshift_ratio = mult_bitshift<math_bits_ratio{ P, Q }, max_input_value, IoType, CalcType, Options>;
 
 // =================================================================================================
@@ -1575,9 +1725,9 @@ struct math_bits_topology
     };
 };
 
-// Options for mult_bitshift_ratio_dyn: everything from mult_bitshift_options (max_error, deep_test,
-// clamp_input, trade_speed_for_precision, min_output_range, out_type) plus the gain contract.
-struct mult_bitshift_ratio_dyn_options : mult_bitshift_options
+// Options for mult_bitshift_ratio_dyn: everything from mult_bitshift_ratio_options (max_error,
+// deep_test, clamp_input, rounding, min_output_range, out_type) plus the gain contract.
+struct mult_bitshift_ratio_dyn_options : mult_bitshift_ratio_options
 {
     // The contract for a runtime gain num/den: set() / prepare() reject num or den outside these
     // ranges (the old gain stays active). Must be set: num_max >= 1, den_min >= 1.
@@ -1635,6 +1785,15 @@ public:
     using out_type  = std::conditional_t<std::is_void_v<typename Options::out_type>,
                                          IoType, typename Options::out_type>;
     using options   = Options;
+
+    // Options must derive from mult_bitshift_ratio_dyn_options; trade_speed_for_precision (the
+    // floating-point form's option) is rejected, so that it is not silently ignored.
+    static_assert(std::is_base_of_v<mult_bitshift_ratio_dyn_options, Options>,
+                  "mult_bitshift_ratio_dyn: Options must derive from mult_bitshift_ratio_dyn_options");
+    static_assert(!std::is_base_of_v<mult_bitshift_ratio_dyn_options, Options> || !requires { Options::trade_speed_for_precision; },
+                  "mult_bitshift_ratio_dyn: trade_speed_for_precision is not an option of the ratio types, use "
+                  "static constexpr math_bits_rounding rounding = math_bits_rounding::nearest;");
+
     using topology  = typename Options::topology;
 
     // Result of set() / prepare(): ok, clamped to the gain range (clamp_gain), or rejected (num or
@@ -1644,7 +1803,9 @@ public:
     static constexpr out_type max_error                = static_cast<out_type>(Options::max_error);
     static constexpr bool     deep_test                = Options::deep_test;
     static constexpr bool     clamp_input              = Options::clamp_input;
-    static constexpr bool     trade_speed_for_precision = Options::trade_speed_for_precision;
+    static constexpr math_bits_rounding rounding       = Options::rounding;
+    static constexpr bool     round_nearest            = rounding == math_bits_rounding::nearest;
+    static constexpr bool     round_ceiling            = rounding == math_bits_rounding::ceiling;
     static constexpr bool     clamp_gain               = Options::clamp_gain;
     static constexpr uint64_t num_min = Options::num_min, num_max = Options::num_max;
     static constexpr uint64_t den_min = Options::den_min, den_max = Options::den_max;
@@ -1680,6 +1841,13 @@ private:
         const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(u128(r.num) << s, r.den);
         return qr.rem ? qr.quot + u128(1) : qr.quot;
     }
+    // The multiplier of gain r at shift s: r * 2^s rounded up, or down when rounding to ceiling (see
+    // the error guarantee below; the cheaper ceiling form ceil_xnz uses m_active, at most this).
+    static constexpr u128 m_scaled(const math_bits_ratio& r, int s)
+    {
+        if constexpr (round_ceiling) return math_bits_detail::divmod(u128(r.num) << s, r.den).quot;
+        else                         return ceil_scaled(r, s);
+    }
 
 public:
     // The gains that can become active: [gain_lo, gain_hi], from the num/den contract and the
@@ -1697,39 +1865,64 @@ public:
     static constexpr bool fixed_den = den_min == den_max;
 
     // ---- Error guarantee, proven for every gain the contract allows ----
-    // The multiplier is rounded up, M = ceil(num * 2^s / den), so rho = M*den - num*2^s is in
-    // [0, den-1] and mult(x) = floor(x*num/den + x*e) with 0 <= x*e = x*rho/(den*2^s). The fractional
-    // part of x*num/den is at most (den-1)/den, so the error stays in [0, k] for k = max_error when
-    //   truncating:  max_input * rho_max     < (k*den + 1) * 2^s
-    //   rounding:    2*max_input * rho_max   < (2k*den + 1) * 2^s   (steps of 1/(2den))
+    // Floor and nearest: the multiplier is rounded up, M = ceil(num * 2^s / den), so rho = M*den -
+    // num*2^s is in [0, den-1] and mult(x) = floor(x*num/den + x*e) with 0 <= x*e = x*rho/(den*2^s).
+    // The fractional part of x*num/den is at most (den-1)/den, so the error stays in [0, k] for
+    // k = max_error when
+    //   floor:     max_input * rho_max     < (k*den + 1) * 2^s
+    //   nearest:   2*max_input * rho_max   < (2k*den + 1) * 2^s   (steps of 1/(2den))
+    // Ceiling: the mirror image. The multiplier is rounded down, M = floor(num * 2^s / den), so
+    // rho = num*2^s - M*den is in [0, den-1], and mult(x) = ceil(x*num/den - x*rho/(den*2^s)) with the
+    // bias 2^s - 1. A value n + j/den (j >= 1) stays above n - k as long as x*rho/(den*2^s) < k + 1/den,
+    // and an integer n stays above n - k - 1 then, so the error stays in [-k, 0] under the same
+    // inequality as floor. (A multiplier rounded up would put every exact result 1 above.)
     // Over a range of denominators rho_max = den-1: linear in den, so the bound holds for all allowed
     // denominators when it holds at the extremes, den_min and den_max. For a single denominator (a
     // fixed den, or a clamping limit) rho_max = den - gcd(den, 2^s), since rho is a multiple of that
-    // gcd: the same for an odd den, exact (rho = 0) for a power of two up to 2^s.
+    // gcd (for both roundings of M): the same for an odd den, exact (rho = 0) for a power of two up
+    // to 2^s.
+    //
+    // Ceiling, cheaper form (ceil_xnz, used when proven): M = ceil(num * 2^s / den) - 1, and
+    // mult(x) = floor(x * M / 2^s) + (x != 0), with no bias and no low bits of the product. M is then
+    // strictly below num * 2^s / den, rho = num*2^s - M*den is in [1, den] (for a single den too),
+    // and with eta = x*rho/(den*2^s) > 0 for x >= 1: an integer n gives floor(n - eta) + 1 = n
+    // (for eta <= 1), and n + j/den (j >= 1) gives n + 1 down to n + 1 - k as long as
+    // eta <= k + j/den. So the error stays in [-k, 0] when
+    //   max_input * den  <=  (k*den + 1) * 2^s
+    // Slightly stronger than the bias form (rho up to den instead of den - 1, and no exact power-of-two
+    // case), and it needs every active gain > 0 (x = 0 must give 0).
     static constexpr uint64_t rho_max(uint64_t den, int s, bool single)
     {
         if (!single) return den - 1;
         const int tz = std::countr_zero(den);
         return den - (uint64_t{1} << (tz < s ? tz : s));
     }
-    static constexpr bool error_proven_for(uint64_t den, int s, bool single)
+    static constexpr bool error_proven_for(uint64_t den, int s, bool single, bool xnz = false)
     {
-        if (den <= 1) return true;                                        // integer gain: exact
-        constexpr int r = trade_speed_for_precision ? 1 : 0;
-        if (s < r) return false;
-        const u128 W = math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), rho_max(den, s, single)) >> (s - r);
         const u128 kd = math_bits_detail::mul64(Options::max_error, den);
+        if (xnz)                                                          // ceil(max_input * den / 2^s) <= k*den + 1
+        {
+            const u128 L = math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), den);
+            const u128 Lq = L >> s;
+            return Lq + u128((Lq << s) == L ? 0u : 1u) <= kd + u128(1);
+        }
+        if (den <= 1) return true;                                        // integer gain: exact
+        constexpr int r = round_nearest ? 1 : 0;
+        if (s < r) return false;
+        const u128 P = math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), rho_max(den, s, single));
+        const u128 W = P >> (s - r);
         if (r && (kd.hi >> 63)) return true;                              // right side >= 2^128 > W
         return W < (r ? (kd << 1) : kd) + u128(1);                        // floor(lhs / 2^s) < k*den + 1
     }
-    static constexpr bool error_proven_at(int s)
+    static constexpr bool error_proven_at(int s, bool xnz = false)
     {
-        return error_proven_for(den_min, s, fixed_den) && error_proven_for(den_max, s, fixed_den)
-            && (!clamp_gain || !gain_min_restricts || error_proven_for(Options::gain_min.den, s, true))
-            && (!clamp_gain || !gain_max_restricts || error_proven_for(Options::gain_max.den, s, true));
+        return error_proven_for(den_min, s, fixed_den, xnz) && error_proven_for(den_max, s, fixed_den, xnz)
+            && (!clamp_gain || !gain_min_restricts || error_proven_for(Options::gain_min.den, s, true, xnz))
+            && (!clamp_gain || !gain_max_restricts || error_proven_for(Options::gain_max.den, s, true, xnz));
     }
 
-    // The shift: the largest s < digits(calc_type) with max_input * ceil(gain_hi * 2^s) <= max(calc_type).
+    // The shift: the largest s < digits(calc_type) with max_input * M(gain_hi) <= max(calc_type)
+    // (M = m_scaled: gain_hi * 2^s rounded up, or down for ceiling).
     // With a calc_type wider than 32 bits, a smaller shift is taken when it keeps the multiplier
     // within 32 bits and the error guarantee still holds: the multiplier is then one atomic word and
     // the multiply cheaper (no high word), with the same guarantee. (The split multiply needs s >= 32.)
@@ -1739,7 +1932,7 @@ public:
         int full = 0;
         for (int s = std::numeric_limits<calc_type>::digits - 1; s > 0; --s)
         {
-            const u128 M = ceil_scaled(gain_hi, s);
+            const u128 M = m_scaled(gain_hi, s);
             if (M.hi == 0 && math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), M.lo) <= calc_max) { full = s; break; }
         }
         if constexpr (std::numeric_limits<calc_type>::digits > 32)
@@ -1747,15 +1940,25 @@ public:
             constexpr bool split = (MATH_BITS_SPLIT_MUL64 != 0) && std::numeric_limits<calc_type>::digits == 64
                                    && std::numeric_limits<out_type>::digits <= 32;
             for (int s = full; s >= (split ? 32 : 1); --s)
-                if ((ceil_scaled(gain_hi, s).lo >> 32) == 0 && ceil_scaled(gain_hi, s).hi == 0)
+                if ((m_scaled(gain_hi, s).lo >> 32) == 0 && m_scaled(gain_hi, s).hi == 0)
                     return static_cast<uint8_t>(error_proven_at(s) ? s : full);   // largest 32-bit shift
         }
         return static_cast<uint8_t>(full);
     }
     static constexpr uint8_t bitShifts = calc_bitshifts();
 
+    // Ceiling: the cheaper form floor(x * M / 2^s) + (x != 0) with M = ceil(gain * 2^s) - 1 when its
+    // (slightly stronger) error bound holds and every active gain is > 0; else the bias form.
+    static constexpr bool ceil_xnz = round_ceiling && gain_lo.num >= 1 && error_proven_at(bitShifts, true);
+    // The multiplier set() computes for gain r (m_scaled, or one below the rounded-up one for ceil_xnz).
+    static constexpr u128 m_active(const math_bits_ratio& r)
+    {
+        if constexpr (ceil_xnz) return ceil_scaled(r, bitShifts) - u128(1);
+        else                    return m_scaled(r, bitShifts);
+    }
+
     // Multiplier of the largest gain: every active multiplier is at most this.
-    static constexpr u128 mult_factor_int_max_u128 = ceil_scaled(gain_hi, bitShifts);
+    static constexpr u128 mult_factor_int_max_u128 = m_active(gain_hi);
     static_assert(mult_factor_int_max_u128.hi == 0
                   && math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), mult_factor_int_max_u128.lo)
                      <= u128(static_cast<uint64_t>(std::numeric_limits<calc_type>::max())),
@@ -1764,10 +1967,12 @@ public:
 
     // Output range: mult(max_input) at the largest gain must fit out_type with max_error (and the
     // rounding half LSB) of headroom; the largest gain must give outputs of at least 1 LSB, and
-    // the smallest one at least min_output_range LSBs when that is set.
-    static_assert(static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - Options::max_error >= (trade_speed_for_precision ? 1u : 0u)
+    // the smallest one at least min_output_range LSBs when that is set. With ceiling, mult() is never
+    // above ceil(x * gain), which fits when max_input * gain_hi does: no headroom needed.
+    static constexpr uint64_t out_headroom = round_ceiling ? 0u : Options::max_error + (round_nearest ? 1u : 0u);
+    static_assert(static_cast<uint64_t>(std::numeric_limits<out_type>::max()) >= out_headroom
                   && math_bits_detail::cmp_scaled_products(u128(gain_hi.num), static_cast<uint64_t>(max_input_value), 0,
-                         u128(static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - Options::max_error - (trade_speed_for_precision ? 1u : 0u)),
+                         u128(static_cast<uint64_t>(std::numeric_limits<out_type>::max()) - out_headroom),
                          gain_hi.den, 0) <= 0,
                   "max_input_value * largest gain would overflow out_type (no headroom for max_error or rounding)!");
     static_assert(math_bits_detail::cmp_scaled_products(u128(gain_hi.num), static_cast<uint64_t>(max_input_value), 0, u128(1), gain_hi.den, 0) >= 0,
@@ -1776,7 +1981,7 @@ public:
                   || math_bits_detail::cmp_scaled_products(u128(gain_lo.num), static_cast<uint64_t>(max_input_value), 0,
                                                            u128(Options::min_output_range), gain_lo.den, 0) >= 0,
                   "max_input_value * smallest gain < Options::min_output_range: output too coarse");
-    static_assert(!trade_speed_for_precision || bitShifts >= 1, "trade_speed_for_precision needs bitShifts >= 1 (gain range too large for calc_type)");
+    static_assert(!round_nearest || bitShifts >= 1, "rounding = math_bits_rounding::nearest needs bitShifts >= 1 (gain range too large for calc_type)");
 
     static constexpr bool error_proven = error_proven_at(bitShifts);
     static_assert(error_proven,
@@ -1793,17 +1998,24 @@ public:
         && std::numeric_limits<calc_type>::digits == 64
         && std::numeric_limits<out_type>::digits <= 32
         && std::numeric_limits<io_type>::digits <= 64;
+    // The bias added before the shift: 2^(s-1) to nearest, 2^s - 1 to ceiling (bias form).
+    static constexpr calc_type add_bias = round_nearest ? round_bias
+        : !round_ceiling || ceil_xnz || bitShifts == 0 ? calc_type(0)
+        : static_cast<calc_type>((calc_type(1) << bitShifts) - 1u);
     // Rounding by shift (as in mult_bitshift): when the bias does not fit next to the largest
     // product, or when the bias constant is large on cores that cannot add it directly.
     static constexpr bool bias_fits = math_bits_detail::mul64(static_cast<uint64_t>(max_input_value), mult_factor_int_max_u128.lo)
-        + u128(static_cast<uint64_t>(round_bias)) <= u128(static_cast<uint64_t>(std::numeric_limits<calc_type>::max()));
-    static constexpr bool round_by_shift = trade_speed_for_precision && bitShifts > 0
+        + u128(static_cast<uint64_t>(add_bias)) <= u128(static_cast<uint64_t>(std::numeric_limits<calc_type>::max()));
+    static constexpr bool round_by_shift = round_nearest && bitShifts > 0
         && (!bias_fits
             || (MATH_BITS_SHIFT_ROUND_MIN_BIAS != 0
                 && (use_split_mul64 ? (bitShifts == 32 ? (uint64_t{1} << 31) : (uint64_t{1} << (bitShifts - 33)))
                                     : static_cast<uint64_t>(round_bias)) >= static_cast<uint64_t>(MATH_BITS_SHIFT_ROUND_MIN_BIAS)));
+    // Ceiling without room for the bias (the product fills the top of calc_type): ceil(v / 2^s) =
+    // (v >> s) + (any of the s low bits set). Same results, one or two instructions more.
+    static constexpr bool ceil_by_sticky = round_ceiling && !ceil_xnz && bitShifts > 0 && !bias_fits;
 
-    // (x * M [+ round_bias]) >> bitShifts for a multiplier M, rounded as configured. No clamp.
+    // (x * M [+ bias]) >> bitShifts for a multiplier M, rounded as configured. No clamp.
     MATH_BITS_ALWAYS_INLINE static constexpr out_type mult_with(io_type input_val, m_type M)
     {
         if constexpr (use_split_mul64)
@@ -1839,12 +2051,25 @@ public:
                 else if constexpr (bitShifts == 33) return static_cast<out_type>((hi >> 1) + (hi & 1u));
                 else                                return static_cast<out_type>(((hi >> (bitShifts - 33)) + 1u) >> 1);
             }
-            else if constexpr (trade_speed_for_precision)
+            else if constexpr (round_nearest)
             {
                 constexpr uint32_t b_lo = static_cast<uint32_t>(round_bias);
                 constexpr uint32_t b_hi = static_cast<uint32_t>(static_cast<uint64_t>(round_bias) >> 32);
                 lo += b_lo;
                 hi += b_hi + (lo < b_lo ? 1u : 0u);
+            }
+            else if constexpr (ceil_xnz)
+                return static_cast<out_type>((hi >> (bitShifts - 32)) + (input_val != 0 ? 1u : 0u));
+            else if constexpr (ceil_by_sticky)
+            {
+                // (A >> s) + (any bit below s set): the low word and the low s-32 bits of hi.
+                constexpr uint32_t hi_mask = (uint32_t{1} << (bitShifts - 32)) - 1u;
+                return static_cast<out_type>((hi >> (bitShifts - 32)) + ((lo | (hi & hi_mask)) != 0 ? 1u : 0u));
+            }
+            else if constexpr (round_ceiling)
+            {
+                constexpr uint32_t b_hi = static_cast<uint32_t>(static_cast<uint64_t>(add_bias) >> 32);
+                hi += b_hi + (lo != 0 ? 1u : 0u);                           // low word 0xFFFFFFFF carries iff lo != 0
             }
             return static_cast<out_type>(hi >> (bitShifts - 32));
         }
@@ -1856,7 +2081,14 @@ public:
                 if constexpr (bitShifts >= 2) return static_cast<out_type>(static_cast<calc_type>((v >> (bitShifts - 1)) + 1u) >> 1);
                 else                          return static_cast<out_type>((v >> 1) + (v & 1u));
             }
-            else if constexpr (trade_speed_for_precision) return static_cast<out_type>(static_cast<calc_type>(v + round_bias) >> bitShifts);
+            else if constexpr (round_nearest) return static_cast<out_type>(static_cast<calc_type>(v + round_bias) >> bitShifts);
+            else if constexpr (ceil_xnz)      return static_cast<out_type>((v >> bitShifts) + (input_val != 0 ? 1u : 0u));
+            else if constexpr (ceil_by_sticky)
+            {
+                constexpr calc_type low_mask = static_cast<calc_type>((calc_type(1) << bitShifts) - 1u);
+                return static_cast<out_type>((v >> bitShifts) + ((v & low_mask) != 0 ? 1u : 0u));
+            }
+            else if constexpr (round_ceiling) return static_cast<out_type>(static_cast<calc_type>(v + add_bias) >> bitShifts);
             else                                          return static_cast<out_type>(v >> bitShifts);
         }
     }
@@ -1887,8 +2119,8 @@ public:
         uint64_t num, den;     // the gain that m represents (the limit when clamped)
     };
     // Multipliers of the gain limits, used when clamping (0 when a limit does not restrict).
-    static constexpr m_type M_gain_min = gain_min_restricts ? static_cast<m_type>(ceil_scaled(Options::gain_min, bitShifts).lo) : m_type(0);
-    static constexpr m_type M_gain_max = gain_max_restricts ? static_cast<m_type>(ceil_scaled(Options::gain_max, bitShifts).lo) : m_type(0);
+    static constexpr m_type M_gain_min = gain_min_restricts ? static_cast<m_type>(m_active(Options::gain_min).lo) : m_type(0);
+    static constexpr m_type M_gain_max = gain_max_restricts ? static_cast<m_type>(m_active(Options::gain_max).lo) : m_type(0);
 
     // Fixed denominator only: the gain num / den_min.
     static constexpr evaluation evaluate(uint64_t num) requires fixed_den { return evaluate(num, den_min); }
@@ -1909,7 +2141,8 @@ public:
 
     // Fixed denominator D = den_min: M without a runtime division. With 2^s = q0*D + r0 (compile time),
     //   M = ceil(num * 2^s / D) = num*q0 + ceil(num*r0 / D),
-    // and ceil(num*r0 / D) = floor(y / D) for y = num*r0 + D-1. That is a division by a constant over
+    // and ceil(num*r0 / D) = floor(y / D) for y = num*r0 + D-1 (minus 1 for ceil_xnz; for the bias form
+    // of ceiling, where M is rounded down: floor(num*r0 / D), y = num*r0). That is a division by a constant over
     // the small range y <= y_max: floor(y * m / 2^t) with m = ceil(2^t / D), exact for every
     // y <= y_max when y_max * (m*D - 2^t) < 2^t (the 1/D argument above, with k = 0). The smallest
     // such t is taken. Applies when num_max, y_max and m are below 2^32 (one 32x32 -> 64 multiply);
@@ -1922,6 +2155,9 @@ public:
         uint32_t m;            // ceil(2^t / D) (unused when r0 == 0: nothing to divide)
         int      t;
     };
+    // Rounding of M in set(): down (bias form of ceiling), or up and then minus 1 (ceil_xnz).
+    static constexpr bool     m_round_down = round_ceiling && !ceil_xnz;
+    static constexpr uint32_t m_minus1     = ceil_xnz ? 1u : 0u;
     static constexpr fixed_den_plan calc_fixed_den_plan()
     {
         fixed_den_plan p{ false, 0, 0, false, 0, 0 };
@@ -1934,7 +2170,7 @@ public:
         p.narrow = (nq.lo >> 32) == 0;
         if (p.r0 != 0)
         {
-            const u128 y_max = math_bits_detail::mul64(num_max, p.r0) + u128(D - 1);
+            const u128 y_max = math_bits_detail::mul64(num_max, p.r0) + u128(m_round_down ? 0u : D - 1);
             if (y_max.hi != 0 || (y_max.lo >> 32) != 0) return p;
             for (int t = 0; t < 64; ++t)
             {
@@ -1956,7 +2192,8 @@ public:
     }
     static constexpr fixed_den_plan fixed_plan = calc_fixed_den_plan();
 
-    // M = ceil(num * 2^s / den) for a gain within the contract: without a division for a fixed
+    // M = m_active(num / den) for a gain within the contract: ceil(num * 2^s / den), minus 1 for
+    // ceil_xnz, floor for the bias form of ceiling. Without a division for a fixed
     // denominator (fixed_den_plan), else one 64-bit division when num * 2^s fits 64 bits (decided at
     // compile time from num_max), else a 128-by-64-bit division.
     static constexpr m_type compute_m(uint64_t num, uint64_t den)
@@ -1968,22 +2205,23 @@ public:
             (void)den;                                                      // == den_min (contract)
             const m_type a = p.narrow ? static_cast<m_type>(static_cast<uint32_t>(num) * static_cast<uint32_t>(p.q0))
                                       : static_cast<m_type>(num * p.q0);
-            if constexpr (p.r0 == 0) return a;
+            if constexpr (p.r0 == 0) return static_cast<m_type>(a - m_minus1);
             else
             {
-                const uint32_t y = static_cast<uint32_t>(num) * static_cast<uint32_t>(p.r0) + static_cast<uint32_t>(den_min - 1);
-                return static_cast<m_type>(a + static_cast<m_type>(math_bits_detail::mul32_wide(y, p.m) >> p.t));
+                const uint32_t y = static_cast<uint32_t>(num) * static_cast<uint32_t>(p.r0) + static_cast<uint32_t>(m_round_down ? 0u : den_min - 1);
+                return static_cast<m_type>(a + static_cast<m_type>(math_bits_detail::mul32_wide(y, p.m) >> p.t) - m_minus1);
             }
         }
         else if constexpr (s == 0 || (num_max >> (64 - s)) == 0)
         {
             const uint64_t a = num << s;
-            return static_cast<m_type>(a / den + (a % den != 0 ? 1u : 0u));
+            if constexpr (m_round_down) return static_cast<m_type>(a / den);
+            else                        return static_cast<m_type>(a / den + (a % den != 0 ? 1u : 0u) - m_minus1);
         }
         else
         {
             const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(u128(num) << s, den);
-            return static_cast<m_type>(qr.quot.lo + (qr.rem != 0 ? 1u : 0u));
+            return static_cast<m_type>(qr.quot.lo + (!m_round_down && qr.rem != 0 ? 1u : 0u) - m_minus1);
         }
     }
 
@@ -2127,15 +2365,30 @@ private:
         {
             const math_bits_detail::u128_divmod qr = math_bits_detail::divmod(math_bits_detail::mul64(x, e.num), e.den);
             uint64_t ref = qr.quot.lo;
-            if (trade_speed_for_precision && qr.rem >= e.den - qr.rem) ++ref;
+            if (round_nearest && qr.rem >= e.den - qr.rem) ++ref;
+            if (round_ceiling && qr.rem != 0) ++ref;
             const uint64_t out = static_cast<uint64_t>(saturate(mult_with(static_cast<io_type>(x), e.m)));
             if (saturate_output && ref > Options::output_limit) ref = Options::output_limit;   // min(exact, limit)
-            return out >= ref && out - ref <= Options::max_error;
+            if constexpr (round_ceiling) return out <= ref && ref - out <= Options::max_error;
+            else                         return out >= ref && out - ref <= Options::max_error;
         };
         for (uint64_t i = 0; i < n && i <= mi; ++i)
             if (!check(i) || !check(mi - i)) return false;
         for (uint64_t k = mi / e.den, i = 0; k > 0 && i < n; --k, ++i)     // multiples of den: exact results
-            if (!check(k * e.den) || !check(k * e.den - 1)) return false;
+            if (!check(k * e.den) || !check(k * e.den - 1) || (mi - k * e.den >= 1 && !check(k * e.den + 1))) return false;
+        // The largest inputs with x*num mod den == 1 and == den-1: the fractional parts closest to an
+        // integer from above and below, where the error of ceiling and of floor is largest.
+        if (std::gcd(e.num, e.den) == 1 && e.den >= 2 && e.den < (uint64_t{1} << 62))
+        {
+            const uint64_t inv = math_bits_detail::mod_inverse(e.num % e.den, e.den);
+            const uint64_t starts[2] = { inv, e.den - inv };              // x0 * num == 1 and == -1 (mod den)
+            for (const uint64_t x0 : starts)
+                for (uint64_t x = x0 <= mi ? x0 + (mi - x0) / e.den * e.den : 0, i = 0; x0 <= mi && i < n; ++i, x -= e.den)
+                {
+                    if (!check(x)) return false;
+                    if (x < x0 + e.den) break;
+                }
+        }
         return true;
     }
     static constexpr bool calc_self_test()
@@ -2146,7 +2399,8 @@ private:
     }
     static_assert(calc_self_test(), "mult_bitshift_ratio_dyn self-test failed (implementation error)");
 
-    // Fixed denominator: the division-free compute_m against the exact ceil(num * 2^s / D), for every
+    // Fixed denominator: the division-free compute_m against the exact ceil(num * 2^s / D) (floor for
+    // ceiling), for every
     // num of the contract up to the largest gain (evenly sampled beyond 4096 values, 65536 with deep_test).
     static constexpr bool calc_fixed_den_test()
     {
@@ -2158,7 +2412,7 @@ private:
             auto ok = [](uint64_t num)
             {
                 if (cmp_ratio(num, D, gain_hi.num, gain_hi.den) > 0) return true;   // never computed
-                return compute_m(num, D) == static_cast<m_type>(ceil_scaled(math_bits_ratio{ num, D }, bitShifts).lo);
+                return compute_m(num, D) == static_cast<m_type>(m_active(math_bits_ratio{ num, D }).lo);
             };
             for (uint64_t num = num_min; num_max - num >= step; num += step)
                 if (!ok(num)) return false;

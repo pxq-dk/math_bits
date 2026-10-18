@@ -16,11 +16,11 @@ On-target tests for `math_bits.h`, used to verify `mult_bitshift_ratio_dyn` on a
 
 **`math_bits_hwtest.inc`**: `r[DONE]` becomes 1 when finished; the run time per stress scenario is `stress_ms` (20 s; 300 s for a soak). It uses TIM6 and TIM7 and defines their interrupt handlers (`TIM6_DAC_LPTIM1_IRQHandler`, `TIM7_LPTIM2_IRQHandler`), so the project must not use them, and `HAL_GetTick()` for timing.
 
-- **Functional:** static double and ratio scalers against the target's own soft-float or exact integer reference; runtime gains (32-bit and 64-bit multiplier, rounding, `MPSC`, clamping, random gains) against exact `x·num/den`, including `set()` status codes; input and output clamping (`clamp_input`, `clamp_output`, cfg 26–28) and the fixed denominator (`set(num)`, cfg 29–30) over the whole `io_type` range, also above `max_input_value`.
+- **Functional:** static double and ratio scalers against the target's own soft-float or exact integer reference; runtime gains (32-bit and 64-bit multiplier, rounding, `MPSC`, clamping, random gains) against exact `x·num/den`, including `set()` status codes; input and output clamping (`clamp_input`, `clamp_output`, cfg 26–28) and the fixed denominator (`set(num)`, cfg 29–30) over the whole `io_type` range, also above `max_input_value`; rounding up (`rounding = ceiling`) against exact `⌈x·num/den⌉`: static ratios cfg 50–57, runtime gains cfg 31–41, covering both ceiling forms (`ceil_xnz` and the bias form, also without room for the bias) in the 32-bit and the split 64-bit multiply; `static_assert`s fail the build when a configuration stops covering its path.
 - **Stress:** a jittered writer interrupt (TIM6, priority 2) and reader interrupt (TIM7, priority 1) change the gain and call `mult()` while main does the other side. The writer toggles between two gains; every output must equal the exact result of one of them (a torn multiplier gives neither). This covers both directions, 64-bit and 32-bit multipliers, two writers, and `prepare()` + `apply_new()`.
 - **Negative control:** scenarios 0 and 1 run the same race on an unprotected 64-bit variable. They must show torn reads; zero would mean the test cannot detect tearing.
 
-**`math_bits_bench.inc`**: `r[1]` becomes 1 when finished. Interrupts are off during the run; SysTick is reprogrammed as a free-running cycle counter. Each case is a `noinline` function called through a pointer over 256 random inputs with a warm cache; subtract the identity function (`base`) to get the net cost. `bench_decode.py` prints both raw and net figures. The fixed-denominator cases (`fA0`, `setF1`, `setF0`: gain `num/4095`, `set(num)` without a division) were added on 2026-10-18 and are not yet in the results below.
+**`math_bits_bench.inc`**: `r[1]` becomes 1 when finished. Interrupts are off during the run; SysTick is reprogrammed as a free-running cycle counter. Each case is a `noinline` function called through a pointer over 256 random inputs with a warm cache; subtract the identity function (`base`) to get the net cost. `bench_decode.py` prints both raw and net figures. The fixed-denominator cases (`fA0`, `setF1`, `setF0`: gain `num/4095`, `set(num)` without a division) and the ceiling cases (`dA1c`, `dA0c`, `fA0c`, `dTnc`, `setA0c`, `setF0c`, `setTnc`, against plain C `(x·num + den − 1) / den`) were added on 2026-10-18; see the results at the end.
 
 ## Results 2026-10-11 (STM32G071, 64 MHz, 2 wait states, prefetch + I-cache)
 
@@ -33,8 +33,10 @@ On-target tests for `math_bits.h`, used to verify `mult_bitshift_ratio_dyn` on a
 | `-Os`, 300 s per scenario | ≈ 268 M | 0 | 109,571 / 437,792 |
 | `-O0`, 300 s per scenario | ≈ 162 M | 0 | 318,517 / 1,458,399 |
 | `-Os`, 20 s per scenario, 2026-10-18 (with clamp and fixed-denominator checks) | ≈ 16.7 M | 0 | 7,402 / 24,083 |
+| `-Os`, 20 s per scenario, 2026-10-18 (with ceiling checks, cfg 31–41) | ≈ 17.0 M | 0 | 7,535 / 28,846 |
+| `-Os`, 20 s per scenario, 2026-10-18 (with static ceiling checks, cfg 50–57) | ≈ 17.0 M | 0 | 7,514 / 28,786 |
 
-Functional part, every run: 115,840 output checks and 1,800 status checks, 0 failures. Since 2026-10-18 (cfg 26–30 added): 155,840 output checks and 2,300 status checks, 0 failures.
+Functional part, every run: 115,840 output checks and 1,800 status checks, 0 failures. Since 2026-10-18 (cfg 26–30 added): 155,840 output checks and 2,300 status checks, 0 failures. With the ceiling configurations (cfg 31–41, 2026-10-18): 287,220 output checks and 5,200 status checks, 0 failures; with the static ceiling configurations (cfg 50–57): 319,460 output checks and 5,200 status checks, 0 failures.
 
 **Benchmark**, net cycles per call at `-Os`; average (min–max) where the cost depends on the input:
 
@@ -47,3 +49,7 @@ Functional part, every run: 115,840 output checks and 1,800 status checks, 0 fai
 Runtime gain changes: `set()` ≈ 750–790 cycles (≈ 12 µs, mostly `__aeabi_uldivmod`), `prepare()` ≈ 830, `apply_new()` 43.
 
 **Benchmark 2026-10-18** (same board and clock, `-Os`, image built from the project's startup/HAL with the bench as `main_cpp()`; 0 mismatches): fixed denominator `num/4095`, `set(num)` without a division: **60 cycles** (`max_error 1`, `u32` calc) and **64 cycles** (exact, `u64` calc), constant over all inputs — versus 747 / 777 (avg) for `set(num, den)` with a range of denominators in the same run. `mult()` of the fixed-denominator exact scaler: 23 cycles, the same as the runtime gain with a denominator range (`dA0`). The `mult()` figures of this build are 0–2 cycles above the 2026-10-11 table (static ADC 9, runtime 12 / 23, timer 49 / 76 / 49); code layout differs between the two builds. At `-O0`: `mult()` 34 (static ADC) to 188 cycles (`SPSC` timer), `set()` ≈ 1,800.
+
+**Ceiling, 2026-10-18** (same board and build setup, `-Os`, 0 mismatches against plain C): net cycles per `mult()`, floor → `rounding = ceiling`: 12-bit ADC, `u32` calc (`dA1`) 8 → 13; exact, `u64` calc with a 32-bit multiplier (`dA0`) 19 → 25; fixed denominator (`fA0`) 19 → 24; 24-bit timer, 64-bit multiplier (`dTn`) 46 → 49. Plain C ceiling division: 113.5 (ADC) and 127 (timer) on average. `set()`: 836 / 65 / 835 cycles (`setA0c` / `setF0c` / `setTnc`), versus 833 / 64 / 826 for floor. A first version that added the bias `2^s − 1` in the split multiply needed the whole low word of the product (`dTnc` 69 cycles, with register spills); the form `⌊x·M/2^s⌋ + (x ≠ 0)` replaced it.
+
+**Static ceiling, 2026-10-18** (`sA0c`, `sT0c`; 0 mismatches against plain C): `3300/4095` over 12-bit inputs, `u32` calc, 14 cycles (floor `sA0`: 6; the ceiling code is 4 instructions longer, the rest is code placement); `1/1000` over 24-bit inputs, `u64` calc, 49 cycles (floor `sT0`: 47).

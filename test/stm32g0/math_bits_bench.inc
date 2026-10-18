@@ -10,8 +10,8 @@ namespace mbb
 #define NI __attribute__((noinline))
 
 // ---- configurations ----
-struct me1   : mult_bitshift_options { static constexpr uint64_t max_error = 1; static constexpr bool deep_test = false; };
-struct exact : mult_bitshift_options { static constexpr uint64_t max_error = 0; static constexpr bool deep_test = false; };
+struct me1   : mult_bitshift_ratio_options { static constexpr uint64_t max_error = 1; static constexpr bool deep_test = false; };
+struct exact : mult_bitshift_ratio_options { static constexpr uint64_t max_error = 0; static constexpr bool deep_test = false; };
 
 // IN_ADC 12-bit -> mV, gain 3300/4095
 using sA1  = mult_bitshift_ratio<3300, 4095, 4095u, uint16_t, uint32_t, me1>;     // static, max_error 1
@@ -28,11 +28,24 @@ using fA0  = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, fadc0>;         
 
 // 24-bit timer ticks @ 1 MHz -> ms, gain 1/1000
 using sT0  = mult_bitshift_ratio<1, 1000, 16777215u, uint32_t, uint64_t, exact>;  // static, exact
+struct exactc : exact { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+using sA0c = mult_bitshift_ratio<3300, 4095, 4095u, uint16_t, uint32_t, exactc>;  // static, exact ceiling
+using sT0c = mult_bitshift_ratio<1, 1000, 16777215u, uint32_t, uint64_t, exactc>; // static, exact ceiling
 struct dtk : mult_bitshift_ratio_dyn_options { static constexpr uint64_t num_min = 1, num_max = 10, den_min = 1000, den_max = 1000000;
                                                static constexpr uint64_t max_error = 0; using out_type = uint32_t; using topology = math_bits_topology::SPSC<>; };
 struct dtkn : dtk { using topology = math_bits_topology::None<>; };
 using dT   = mult_bitshift_ratio_dyn<16777215u, uint32_t, uint64_t, dtk>;          // dyn, 64-bit M, SPSC (seq counter)
 using dTn  = mult_bitshift_ratio_dyn<16777215u, uint32_t, uint64_t, dtkn>;         // dyn, 64-bit M, no concurrency
+
+// rounding = ceiling (ceil(x * num / den)), same contracts
+struct dadc1c : dadc1 { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct dadc0c : dadc0 { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct fadc0c : fadc0 { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+struct dtknc  : dtkn  { static constexpr math_bits_rounding rounding = math_bits_rounding::ceiling; };
+using dA1c = mult_bitshift_ratio_dyn<4095u, uint16_t, uint32_t, dadc1c>;
+using dA0c = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, dadc0c>;
+using fA0c = mult_bitshift_ratio_dyn<4095u, uint16_t, uint64_t, fadc0c>;
+using dTnc = mult_bitshift_ratio_dyn<16777215u, uint32_t, uint64_t, dtknc>;
 
 constinit dA1 a1{ 3300, 4095 };
 constinit dA0 a0{ 3300, 4095 };
@@ -40,6 +53,10 @@ constinit fA1 f1{ 3300 };
 constinit fA0 f0{ 3300 };
 constinit dT  tk{ 1, 1000 };
 constinit dTn tkn{ 1, 1000 };
+constinit dA1c a1c{ 3300, 4095 };
+constinit dA0c a0c{ 3300, 4095 };
+constinit fA0c f0c{ 3300 };
+constinit dTnc tknc{ 1, 1000 };
 volatile uint32_t g_num_adc = 3300, g_den_adc = 4095, g_num_tk = 1, g_den_tk = 1000;
 
 extern "C" {
@@ -57,6 +74,14 @@ NI uint32_t b_dT(uint32_t x)       { return tk.mult(x); }
 NI uint32_t b_dTn(uint32_t x)      { return tkn.mult(x); }
 NI uint32_t b_cT_const(uint32_t x) { return x / 1000u; }                                      // plain C, constant
 NI uint32_t b_cT_rt(uint32_t x)    { return (uint32_t)((uint64_t)x * g_num_tk / g_den_tk); }  // plain C, runtime gain
+NI uint32_t b_dA1c(uint32_t x)     { return a1c.mult((uint16_t)x); }                         // ceiling
+NI uint32_t b_sA0c(uint32_t x)     { return sA0c::mult((uint16_t)x); }
+NI uint32_t b_sT0c(uint32_t x)     { return sT0c::mult(x); }
+NI uint32_t b_dA0c(uint32_t x)     { return a0c.mult((uint16_t)x); }
+NI uint32_t b_fA0c(uint32_t x)     { return f0c.mult((uint16_t)x); }
+NI uint32_t b_cA_ceil(uint32_t x)  { return (x * 3300u + 4094u) / 4095u; }                    // plain C ceiling, constant
+NI uint32_t b_dTnc(uint32_t x)     { return tknc.mult(x); }
+NI uint32_t b_cT_ceil(uint32_t x)  { return (x + 999u) / 1000u; }
 // set() cases: uint32_t f(uint32_t num, uint32_t den)
 NI uint32_t b_base2(uint32_t n, uint32_t d)  { return n + d; }
 NI uint32_t b_setA1(uint32_t n, uint32_t d)  { return (uint32_t)a1.set(n, d); }
@@ -67,6 +92,9 @@ NI uint32_t b_setT(uint32_t n, uint32_t d)   { return (uint32_t)tk.set(n, d); }
 NI uint32_t b_setTn(uint32_t n, uint32_t d)  { return (uint32_t)tkn.set(n, d); }
 NI uint32_t b_prepT(uint32_t n, uint32_t d)  { return (uint32_t)tk.prepare(n, d); }
 NI uint32_t b_applyT(uint32_t, uint32_t)     { return (uint32_t)tk.apply_new(); }
+NI uint32_t b_setA0c(uint32_t n, uint32_t d) { return (uint32_t)a0c.set(n, d); }               // ceiling: M rounded down
+NI uint32_t b_setF0c(uint32_t n, uint32_t)   { return (uint32_t)f0c.set(n); }
+NI uint32_t b_setTnc(uint32_t n, uint32_t d) { return (uint32_t)tknc.set(n, d); }
 }
 
 using F1 = uint32_t (*)(uint32_t);
@@ -75,8 +103,12 @@ enum : uint32_t { IN_ADC = 0, IN_TICK = 1 };
 struct C1 { F1 f; uint32_t in; };
 struct C2 { F2 f; uint32_t in; };
 const C1 cases1[] = { {b_base, IN_ADC}, {b_sA1, IN_ADC}, {b_sA0, IN_ADC}, {b_dA1, IN_ADC}, {b_dA0, IN_ADC}, {b_fA0, IN_ADC}, {b_cA_const, IN_ADC}, {b_cA_rt, IN_ADC},
-                      {b_base, IN_TICK}, {b_sT0, IN_TICK}, {b_dT, IN_TICK}, {b_dTn, IN_TICK}, {b_cT_const, IN_TICK}, {b_cT_rt, IN_TICK} };
-const C2 cases2[] = { {b_base2, IN_ADC}, {b_setA1, IN_ADC}, {b_setA0, IN_ADC}, {b_setF1, IN_ADC}, {b_setF0, IN_ADC}, {b_base2, IN_TICK}, {b_setT, IN_TICK}, {b_setTn, IN_TICK}, {b_prepT, IN_TICK}, {b_applyT, IN_TICK} };
+                      {b_base, IN_TICK}, {b_sT0, IN_TICK}, {b_dT, IN_TICK}, {b_dTn, IN_TICK}, {b_cT_const, IN_TICK}, {b_cT_rt, IN_TICK},
+                      {b_base, IN_ADC}, {b_dA1c, IN_ADC}, {b_dA0c, IN_ADC}, {b_fA0c, IN_ADC}, {b_cA_ceil, IN_ADC},
+                      {b_base, IN_TICK}, {b_dTnc, IN_TICK}, {b_cT_ceil, IN_TICK},
+                      {b_base, IN_ADC}, {b_sA0c, IN_ADC}, {b_base, IN_TICK}, {b_sT0c, IN_TICK} };
+const C2 cases2[] = { {b_base2, IN_ADC}, {b_setA1, IN_ADC}, {b_setA0, IN_ADC}, {b_setF1, IN_ADC}, {b_setF0, IN_ADC}, {b_base2, IN_TICK}, {b_setT, IN_TICK}, {b_setTn, IN_TICK}, {b_prepT, IN_TICK}, {b_applyT, IN_TICK},
+                      {b_base2, IN_ADC}, {b_setA0c, IN_ADC}, {b_setF0c, IN_ADC}, {b_base2, IN_TICK}, {b_setTnc, IN_TICK} };
 constexpr uint32_t N1 = sizeof(cases1) / sizeof(cases1[0]), N2 = sizeof(cases2) / sizeof(cases2[0]);
 
 // r: MAGIC, DONE, SystemCoreClock, FLASH->ACR, mismatches, then per case {min, sum, max} (N1 + N2 cases)
@@ -112,6 +144,11 @@ void run()
         mism += b_sT0(in_tk[i]) != b_cT_const(in_tk[i]);
         mism += b_dT(in_tk[i]) != b_cT_const(in_tk[i]);
         mism += b_dTn(in_tk[i]) != b_cT_const(in_tk[i]);
+        mism += b_dA0c(in_adc[i]) != b_cA_ceil(in_adc[i]);
+        mism += b_fA0c(in_adc[i]) != b_cA_ceil(in_adc[i]);
+        mism += b_dTnc(in_tk[i]) != b_cT_ceil(in_tk[i]);
+        mism += b_sA0c(in_adc[i]) != b_cA_ceil(in_adc[i]);
+        mism += b_sT0c(in_tk[i]) != b_cT_ceil(in_tk[i]);
     }
     r[4] = mism;
 
