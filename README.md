@@ -91,7 +91,7 @@ if (adc.set(cal_num, cal_den) == adc_scale::status::rejected) { /* old gain stil
 // or two-phase: adc.prepare(n, d) computes and checks (old gain stays active), adc.apply_new() switches
 ```
 
-`mult_bitshift_ratio_dyn<max_input_value, io_type, calc_type, Options>`; the options derive from `mult_bitshift_ratio_dyn_options`, which has everything from `mult_bitshift_options` (`max_error`, `trade_speed_for_precision`, `clamp_input`, `out_type`, …) plus:
+`mult_bitshift_ratio_dyn<max_input_value, io_type, calc_type, Options>`; the options derive from `mult_bitshift_ratio_dyn_options`, which has everything from `mult_bitshift_options` (`max_error`, `trade_speed_for_precision`, `clamp_input`, `out_type`, …). Here `clamp_input` clamps the input itself: an input above `max_input_value` gives `mult(max_input_value)` at the active gain (there is no fixed `max_output_int`, since the largest result depends on the gain). Added options:
 
 | Member | Default | Description |
 |---|---|---|
